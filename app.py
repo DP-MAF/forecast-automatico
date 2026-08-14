@@ -3,13 +3,13 @@ import pandas as pd
 import numpy as np
 import io
 import warnings
-from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
-# =========================
-# Optional imports
-# =========================
+
+# =========================================================
+# IMPORTS OPCIONALES
+# =========================================================
 
 try:
     import plotly.graph_objects as go
@@ -37,9 +37,9 @@ except Exception:
     LGBM_AVAILABLE = False
 
 
-# =========================
-# Streamlit config
-# =========================
+# =========================================================
+# CONFIGURACION STREAMLIT
+# =========================================================
 
 st.set_page_config(
     page_title="Forecast automático de ventas",
@@ -49,35 +49,33 @@ st.set_page_config(
 
 st.title("📈 Forecast automático de ventas")
 st.caption(
-    "App para seleccionar automáticamente el mejor modelo de previsión mediante backtesting "
-    "y generar una previsión de 18 meses."
+    "Aplicación para seleccionar automáticamente el mejor modelo de previsión "
+    "mediante backtesting y generar una previsión de 18 meses."
 )
 
 
-# =========================
-# Utility functions
-# =========================
+# =========================================================
+# FUNCIONES DE LIMPIEZA Y LECTURA
+# =========================================================
 
 def clean_number(value):
     """
-    Convierte textos numéricos desde Excel en número.
-    Soporta formatos:
-    - 1.234,56
-    - 1234,56
-    - 1,234.56
-    - 1234.56
+    Convierte números pegados desde Excel.
+    Soporta:
+    1.234,56
+    1234,56
+    1,234.56
+    1234.56
     """
+
     if pd.isna(value):
         return np.nan
 
-    text = str(value).strip()
+    text = str(value).strip().replace(" ", "")
 
     if text == "":
         return np.nan
 
-    text = text.replace(" ", "")
-
-    # Caso europeo: 1.234,56
     if "," in text and "." in text:
         if text.rfind(",") > text.rfind("."):
             text = text.replace(".", "")
@@ -93,61 +91,95 @@ def clean_number(value):
         return np.nan
 
 
+def looks_like_date(value):
+    text = str(value).strip()
+
+    if text == "":
+        return False
+
+    try:
+        parsed = pd.to_datetime(text, errors="coerce")
+        return not pd.isna(parsed)
+    except Exception:
+        return False
+
+
 def parse_pasted_data(raw_text, start_month):
     """
-    Lee datos pegados desde Excel.
-    Permite:
-    1) Dos columnas: Fecha + Ventas
-    2) Una columna: Ventas, generando fechas desde start_month
+    Permite dos formatos:
+    1. Fecha + Ventas
+    2. Solo Ventas
+
+    Recomendado desde Excel:
+    Fecha    Ventas
+    2025-01  1200
+    2025-02  1350
     """
+
     if raw_text is None or raw_text.strip() == "":
         raise ValueError("No se han introducido datos.")
 
     raw_text = raw_text.strip()
 
-    # Intentar detectar separador
-    possible_separators = ["\t", ";", ","]
-
     df = None
 
-    for sep in possible_separators:
-        try:
-            temp = pd.read_csv(io.StringIO(raw_text), sep=sep, header=None)
-            if temp.shape[1] >= 1:
-                df = temp
-                break
-        except Exception:
-            continue
+    # 1. Intentar tabulador, que es el formato habitual al pegar desde Excel
+    try:
+        temp = pd.read_csv(io.StringIO(raw_text), sep="\t", header=None, engine="python")
+        if temp.shape[1] >= 2:
+            df = temp
+    except Exception:
+        pass
 
+    # 2. Intentar punto y coma
     if df is None:
-        # Fallback por líneas
+        try:
+            temp = pd.read_csv(io.StringIO(raw_text), sep=";", header=None, engine="python")
+            if temp.shape[1] >= 2:
+                df = temp
+        except Exception:
+            pass
+
+    # 3. Intentar coma solo si parece Fecha + Ventas
+    if df is None:
+        try:
+            temp = pd.read_csv(io.StringIO(raw_text), sep=",", header=None, engine="python")
+            if temp.shape[1] >= 2 and looks_like_date(temp.iloc[0, 0]):
+                df = temp
+        except Exception:
+            pass
+
+    # 4. Si no, tratar como una sola columna
+    if df is None:
         lines = raw_text.splitlines()
         df = pd.DataFrame(lines)
 
-    # Eliminar filas completamente vacías
-    df = df.dropna(how="all")
+    df = df.dropna(how="all").reset_index(drop=True)
 
-    # Si hay una cabecera textual, intentar quitarla
+    if df.empty:
+        raise ValueError("No se han podido interpretar los datos pegados.")
+
     first_row = " ".join([str(x).lower() for x in df.iloc[0].values])
-    if any(word in first_row for word in ["fecha", "mes", "venta", "ventas", "cantidad"]):
+
+    if any(w in first_row for w in ["fecha", "mes", "venta", "ventas", "cantidad", "sales"]):
         df = df.iloc[1:].reset_index(drop=True)
 
+    if df.empty:
+        raise ValueError("Después de quitar la cabecera, no quedan datos válidos.")
+
     if df.shape[1] >= 2:
-        # Dos columnas: fecha + ventas
-        dates = pd.to_datetime(df.iloc[:, 0].astype(str).str.strip(), errors="coerce")
+        date_text = df.iloc[:, 0].astype(str).str.strip()
         values = df.iloc[:, 1].apply(clean_number)
 
-        result = pd.DataFrame({
-            "Fecha": dates,
-            "Ventas": values
-        })
+        dates = pd.to_datetime(date_text, errors="coerce")
 
-        # Si la fecha viene como 202501 o 2025-01 y no se ha reconocido bien
-        if result["Fecha"].isna().all():
-            date_text = df.iloc[:, 0].astype(str).str.strip()
+        if dates.isna().all():
             parsed_dates = []
+
             for x in date_text:
+                x = str(x).strip()
                 x = x.replace("/", "-").replace(".", "-")
+
                 try:
                     if len(x) == 6 and x.isdigit():
                         parsed_dates.append(pd.to_datetime(x + "01", format="%Y%m%d"))
@@ -158,10 +190,14 @@ def parse_pasted_data(raw_text, start_month):
                 except Exception:
                     parsed_dates.append(pd.NaT)
 
-            result["Fecha"] = parsed_dates
+            dates = pd.Series(parsed_dates)
+
+        result = pd.DataFrame({
+            "Fecha": dates,
+            "Ventas": values
+        })
 
     else:
-        # Una sola columna: ventas
         values = df.iloc[:, 0].apply(clean_number)
         start_date = pd.to_datetime(start_month + "-01")
         dates = pd.date_range(start=start_date, periods=len(values), freq="MS")
@@ -172,27 +208,27 @@ def parse_pasted_data(raw_text, start_month):
         })
 
     result = result.dropna(subset=["Fecha", "Ventas"]).copy()
-    result["Fecha"] = pd.to_datetime(result["Fecha"])
-    result["Fecha"] = result["Fecha"].dt.to_period("M").dt.to_timestamp()
+    result["Fecha"] = pd.to_datetime(result["Fecha"]).dt.to_period("M").dt.to_timestamp()
     result["Ventas"] = result["Ventas"].astype(float)
 
-    result = result.sort_values("Fecha").drop_duplicates(subset=["Fecha"], keep="last")
+    result = result.sort_values("Fecha")
+    result = result.drop_duplicates(subset=["Fecha"], keep="last")
     result = result.reset_index(drop=True)
 
     if result.empty:
         raise ValueError("No se han podido interpretar los datos pegados.")
 
     if (result["Ventas"] < 0).any():
-        raise ValueError("Existen ventas negativas. Revisa si son devoluciones o errores de dato.")
+        raise ValueError("Existen ventas negativas. Revisa si son devoluciones o errores.")
 
     return result
 
 
 def complete_monthly_series(df):
     """
-    Completa meses faltantes.
-    Si falta algún mes, se rellena con 0.
+    Completa meses faltantes con cero.
     """
+
     full_dates = pd.date_range(
         start=df["Fecha"].min(),
         end=df["Fecha"].max(),
@@ -205,6 +241,10 @@ def complete_monthly_series(df):
 
     return merged
 
+
+# =========================================================
+# METRICAS
+# =========================================================
 
 def safe_mape(actual, forecast):
     actual = np.array(actual, dtype=float)
@@ -247,9 +287,11 @@ def postprocess_forecast(values):
     """
     Evita negativos y redondea a unidades.
     """
+
     arr = np.array(values, dtype=float)
     arr = np.where(np.isnan(arr), 0, arr)
     arr = np.maximum(arr, 0)
+
     return np.round(arr, 0).astype(int)
 
 
@@ -267,9 +309,9 @@ def reliability_label(metric_value):
         return "Muy baja"
 
 
-# =========================
-# Forecast model functions
-# =========================
+# =========================================================
+# MODELOS DE FORECASTING
+# =========================================================
 
 def forecast_naive(y, horizon):
     return np.repeat(y.iloc[-1], horizon)
@@ -277,44 +319,52 @@ def forecast_naive(y, horizon):
 
 def forecast_moving_average(y, horizon, window):
     if len(y) < window:
-        raise ValueError(f"No hay datos suficientes para media móvil {window}.")
+        raise ValueError(f"No hay suficientes datos para media móvil {window}.")
+
     return np.repeat(y.iloc[-window:].mean(), horizon)
 
 
 def forecast_seasonal_naive_12(y, horizon):
     if len(y) < 12:
-        raise ValueError("No hay datos suficientes para seasonal naive 12.")
+        raise ValueError("Naive estacional necesita al menos 12 meses.")
+
     last_12 = y.iloc[-12:].values
-    values = [last_12[i % 12] for i in range(horizon)]
-    return np.array(values)
+
+    return np.array([last_12[i % 12] for i in range(horizon)])
 
 
 def forecast_ses(y, horizon):
     if not STATSMODELS_AVAILABLE:
         raise ValueError("statsmodels no está instalado.")
+
     model = SimpleExpSmoothing(
         y,
         initialization_method="estimated"
     ).fit(optimized=True)
+
     return model.forecast(horizon).values
 
 
 def forecast_holt(y, horizon, damped=False):
     if not STATSMODELS_AVAILABLE:
         raise ValueError("statsmodels no está instalado.")
+
     model = Holt(
         y,
         damped_trend=damped,
         initialization_method="estimated"
     ).fit(optimized=True)
+
     return model.forecast(horizon).values
 
 
-def forecast_hw_additive(y, horizon):
+def forecast_holt_winters(y, horizon):
     if not STATSMODELS_AVAILABLE:
         raise ValueError("statsmodels no está instalado.")
+
     if len(y) < 24:
         raise ValueError("Holt-Winters estacional necesita al menos 24 meses.")
+
     model = ExponentialSmoothing(
         y,
         trend="add",
@@ -322,6 +372,7 @@ def forecast_hw_additive(y, horizon):
         seasonal_periods=12,
         initialization_method="estimated"
     ).fit(optimized=True)
+
     return model.forecast(horizon).values
 
 
@@ -353,6 +404,7 @@ def forecast_arima_simple(y, horizon):
             if model.aic < best_aic:
                 best_aic = model.aic
                 best_model = model
+
         except Exception:
             continue
 
@@ -367,11 +419,12 @@ def forecast_prophet(y, dates, horizon):
         raise ValueError("Prophet no está instalado.")
 
     df_prophet = pd.DataFrame({
-        "ds": dates,
+        "ds": pd.to_datetime(dates),
         "y": y.values
     })
 
-    # Configuraciones prudentes para histórico corto
+    yearly = True if len(y) >= 24 else False
+
     configs = [
         {
             "seasonality_mode": "additive",
@@ -389,9 +442,6 @@ def forecast_prophet(y, dates, horizon):
             "seasonality_prior_scale": 5.0
         }
     ]
-
-    # Para series muy cortas, mejor no forzar estacionalidad anual
-    yearly = True if len(y) >= 24 else False
 
     last_error = None
 
@@ -416,28 +466,19 @@ def forecast_prophet(y, dates, horizon):
             )
 
             forecast = model.predict(future)
+
             return forecast.tail(horizon)["yhat"].values
 
         except Exception as e:
             last_error = e
-            continue
 
     raise ValueError(f"Prophet no ha podido ajustarse: {last_error}")
 
 
-def make_lgbm_features(values, dates):
-    """
-    Convierte una serie en dataset tabular para LightGBM.
-    Features:
-    - lag_1, lag_2, lag_3
-    - rolling_mean_3
-    - rolling_mean_6
-    - month
-    - trend
-    """
+def make_lgbm_training_table(values, dates):
     df = pd.DataFrame({
-        "Fecha": dates,
-        "y": values
+        "Fecha": pd.Series(pd.to_datetime(dates)).reset_index(drop=True),
+        "y": pd.Series(values).reset_index(drop=True)
     })
 
     df["lag_1"] = df["y"].shift(1)
@@ -463,20 +504,20 @@ def make_lgbm_features(values, dates):
     return df, feature_cols
 
 
-def forecast_lgbm_recursive(y, dates, horizon):
+def forecast_lgbm(y, dates, horizon):
     if not LGBM_AVAILABLE:
         raise ValueError("LightGBM no está instalado.")
 
     if len(y) < 12:
         raise ValueError("LightGBM necesita al menos 12 meses.")
 
-    hist_dates = pd.Series(dates).reset_index(drop=True)
+    hist_dates = pd.Series(pd.to_datetime(dates)).reset_index(drop=True)
     hist_values = pd.Series(y.values).reset_index(drop=True)
 
-    train_df, feature_cols = make_lgbm_features(hist_values, hist_dates)
+    train_df, feature_cols = make_lgbm_training_table(hist_values, hist_dates)
 
     if len(train_df) < 5:
-        raise ValueError("No hay suficientes filas entrenables para LightGBM.")
+        raise ValueError("No hay suficientes observaciones entrenables para LightGBM.")
 
     X_train = train_df[feature_cols]
     y_train = train_df["y"]
@@ -493,10 +534,10 @@ def forecast_lgbm_recursive(y, dates, horizon):
 
     model.fit(X_train, y_train)
 
-    future_predictions = []
-
     current_values = list(hist_values.values)
     last_date = hist_dates.iloc[-1]
+
+    predictions = []
 
     for step in range(1, horizon + 1):
         next_date = last_date + pd.DateOffset(months=step)
@@ -521,17 +562,52 @@ def forecast_lgbm_recursive(y, dates, horizon):
         pred = float(model.predict(row[feature_cols])[0])
         pred = max(pred, 0)
 
-        future_predictions.append(pred)
+        predictions.append(pred)
         current_values.append(pred)
 
-    return np.array(future_predictions)
+    return np.array(predictions)
+
+
+# =========================================================
+# CATALOGO OFICIAL DE MODELOS
+# =========================================================
+
+def available_models(n_months):
+    """
+    Modelos incluidos en la herramienta:
+    1. Naive
+    2. Media móvil 3/6
+    3. Suavizado exponencial
+    4. Holt
+    5. ARIMA simple
+    6. Prophet
+    7. LightGBM
+    8. Estacionales si hay >=24 meses
+    """
+
+    models = [
+        "Naive",
+        "Media móvil 3 meses",
+        "Media móvil 6 meses",
+        "Suavizado exponencial",
+        "Holt",
+        "Holt amortiguado",
+        "ARIMA simple",
+        "Prophet",
+        "LightGBM"
+    ]
+
+    if n_months >= 24:
+        models.extend([
+            "Naive estacional 12 meses",
+            "Holt-Winters estacional"
+        ])
+
+    return models
 
 
 def run_model(model_name, y, dates, horizon):
-    """
-    Ejecuta un modelo concreto.
-    """
-    if model_name == "Naive - último valor":
+    if model_name == "Naive":
         return forecast_naive(y, horizon)
 
     if model_name == "Media móvil 3 meses":
@@ -540,20 +616,14 @@ def run_model(model_name, y, dates, horizon):
     if model_name == "Media móvil 6 meses":
         return forecast_moving_average(y, horizon, 6)
 
-    if model_name == "Seasonal naive 12 meses":
-        return forecast_seasonal_naive_12(y, horizon)
-
-    if model_name == "Suavizado exponencial simple":
+    if model_name == "Suavizado exponencial":
         return forecast_ses(y, horizon)
 
-    if model_name == "Holt tendencia":
+    if model_name == "Holt":
         return forecast_holt(y, horizon, damped=False)
 
-    if model_name == "Holt tendencia amortiguada":
+    if model_name == "Holt amortiguado":
         return forecast_holt(y, horizon, damped=True)
-
-    if model_name == "Holt-Winters estacional":
-        return forecast_hw_additive(y, horizon)
 
     if model_name == "ARIMA simple":
         return forecast_arima_simple(y, horizon)
@@ -562,74 +632,61 @@ def run_model(model_name, y, dates, horizon):
         return forecast_prophet(y, dates, horizon)
 
     if model_name == "LightGBM":
-        return forecast_lgbm_recursive(y, dates, horizon)
+        return forecast_lgbm(y, dates, horizon)
+
+    if model_name == "Naive estacional 12 meses":
+        return forecast_seasonal_naive_12(y, horizon)
+
+    if model_name == "Holt-Winters estacional":
+        return forecast_holt_winters(y, horizon)
 
     raise ValueError(f"Modelo no reconocido: {model_name}")
 
 
-def candidate_models(n_months):
+def complexity_rank(model_name):
     """
-    Define modelos candidatos en función del histórico disponible.
+    Para desempates.
+    Si dos modelos tienen una métrica similar, se prioriza el modelo más simple.
     """
-    models = [
-        "Naive - último valor",
-        "Media móvil 3 meses",
-        "Media móvil 6 meses",
-        "Suavizado exponencial simple",
-        "Holt tendencia",
-        "Holt tendencia amortiguada",
-        "ARIMA simple",
-        "Prophet",
-        "LightGBM"
-    ]
 
-    if n_months >= 24:
-        models.append("Seasonal naive 12 meses")
-        models.append("Holt-Winters estacional")
-
-    return models
-
-
-def model_complexity_rank(model_name):
-    """
-    Para desempates: si dos modelos tienen métrica muy parecida,
-    se prefiere el modelo más simple.
-    """
-    ranking = {
-        "Naive - último valor": 1,
+    ranks = {
+        "Naive": 1,
         "Media móvil 3 meses": 2,
         "Media móvil 6 meses": 3,
-        "Seasonal naive 12 meses": 4,
-        "Suavizado exponencial simple": 5,
-        "Holt tendencia": 6,
-        "Holt tendencia amortiguada": 7,
+        "Naive estacional 12 meses": 4,
+        "Suavizado exponencial": 5,
+        "Holt": 6,
+        "Holt amortiguado": 7,
         "Holt-Winters estacional": 8,
         "ARIMA simple": 9,
         "Prophet": 10,
         "LightGBM": 11
     }
-    return ranking.get(model_name, 99)
+
+    return ranks.get(model_name, 99)
 
 
-def run_backtest(df):
+# =========================================================
+# BACKTESTING Y FORECAST FINAL
+# =========================================================
+
+def run_backtesting(df):
     """
     Backtesting:
-    - Train: todo menos últimos 4 meses
+    - Train: todo el histórico menos los últimos 4 meses
     - Test: últimos 4 meses reales
     """
+
     train = df.iloc[:-4].copy()
     test = df.iloc[-4:].copy()
 
     y_train = train["Ventas"]
     dates_train = train["Fecha"]
-
     y_test = test["Ventas"].values
 
-    results = []
+    rows = []
 
-    models = candidate_models(len(df))
-
-    for model_name in models:
+    for model_name in available_models(len(df)):
         try:
             pred = run_model(
                 model_name=model_name,
@@ -644,7 +701,6 @@ def run_backtest(df):
             model_smape = smape(y_test, pred)
             model_wmape = wmape(y_test, pred)
 
-            # Si hay ceros en el test, el MAPE puede ser engañoso.
             if np.any(y_test == 0):
                 selection_metric_name = "sMAPE"
                 selection_metric_value = model_smape
@@ -652,7 +708,7 @@ def run_backtest(df):
                 selection_metric_name = "MAPE"
                 selection_metric_value = model_mape
 
-            results.append({
+            rows.append({
                 "Modelo": model_name,
                 "MAPE_%": model_mape,
                 "sMAPE_%": model_smape,
@@ -668,7 +724,7 @@ def run_backtest(df):
             })
 
         except Exception as e:
-            results.append({
+            rows.append({
                 "Modelo": model_name,
                 "MAPE_%": np.nan,
                 "sMAPE_%": np.nan,
@@ -683,19 +739,18 @@ def run_backtest(df):
                 "Error": str(e)
             })
 
-    results_df = pd.DataFrame(results)
+    results = pd.DataFrame(rows)
 
-    valid = results_df[
-        (results_df["Estado"] == "OK") &
-        (~results_df["Valor métrica selección"].isna())
+    valid = results[
+        (results["Estado"] == "OK") &
+        (~results["Valor métrica selección"].isna())
     ].copy()
 
     if valid.empty:
         raise ValueError("Ningún modelo ha podido calcularse correctamente.")
 
-    valid["Complejidad"] = valid["Modelo"].apply(model_complexity_rank)
+    valid["Complejidad"] = valid["Modelo"].apply(complexity_rank)
 
-    # Orden por métrica y luego por simplicidad
     valid = valid.sort_values(
         by=["Valor métrica selección", "Complejidad"],
         ascending=[True, True]
@@ -703,87 +758,47 @@ def run_backtest(df):
 
     best_model = valid.iloc[0]["Modelo"]
     best_metric = valid.iloc[0]["Valor métrica selección"]
-    metric_name = valid.iloc[0]["Métrica selección"]
+    best_metric_name = valid.iloc[0]["Métrica selección"]
 
-    return best_model, best_metric, metric_name, results_df, train, test
+    return best_model, best_metric, best_metric_name, results, train, test
 
 
-def forecast_final(df, best_model, horizon=18):
-    y = df["Ventas"]
-    dates = df["Fecha"]
-
+def forecast_future(df, model_name, horizon):
     pred = run_model(
-        model_name=best_model,
-        y=y,
-        dates=dates,
+        model_name=model_name,
+        y=df["Ventas"],
+        dates=df["Fecha"],
         horizon=horizon
     )
 
     pred = postprocess_forecast(pred)
 
-    last_date = df["Fecha"].max()
     future_dates = pd.date_range(
-        start=last_date + pd.DateOffset(months=1),
+        start=df["Fecha"].max() + pd.DateOffset(months=1),
         periods=horizon,
         freq="MS"
     )
 
-    forecast_df = pd.DataFrame({
+    return pd.DataFrame({
         "Fecha": future_dates,
         "Mes": [f"M+{i}" for i in range(1, horizon + 1)],
         "Forecast": pred
     })
 
-    return forecast_df
+
+def make_horizontal_forecast(forecast_df, forecast_type, model_name):
+    row = {
+        "Tipo forecast": forecast_type,
+        "Modelo": model_name
+    }
+
+    for i, value in enumerate(forecast_df["Forecast"].values, start=1):
+        row[f"M+{i}"] = int(value)
+
+    return row
 
 
-def fallback_forecast_without_backtest(df, horizon=18):
-    """
-    Para histórico entre 12 y 15 meses:
-    no hay backtesting 12+4 suficiente.
-    Se usa una regla conservadora.
-    """
-    y = df["Ventas"]
-    dates = df["Fecha"]
-
-    fallback_models = [
-        "Holt tendencia amortiguada",
-        "Holt tendencia",
-        "Suavizado exponencial simple",
-        "Media móvil 3 meses",
-        "Naive - último valor"
-    ]
-
-    last_error = None
-
-    for model_name in fallback_models:
-        try:
-            pred = run_model(model_name, y, dates, horizon)
-            pred = postprocess_forecast(pred)
-
-            last_date = df["Fecha"].max()
-            future_dates = pd.date_range(
-                start=last_date + pd.DateOffset(months=1),
-                periods=horizon,
-                freq="MS"
-            )
-
-            forecast_df = pd.DataFrame({
-                "Fecha": future_dates,
-                "Mes": [f"M+{i}" for i in range(1, horizon + 1)],
-                "Forecast": pred
-            })
-
-            return model_name, forecast_df
-
-        except Exception as e:
-            last_error = e
-            continue
-
-    raise ValueError(f"No se ha podido generar forecast fallback: {last_error}")
-
-
-def build_forecast_chart(df, forecast_df, test_df=None, backtest_pred=None):
+def build_chart(df, auto_forecast=None, manual_forecast=None):
     if not PLOTLY_AVAILABLE:
         return None
 
@@ -794,53 +809,130 @@ def build_forecast_chart(df, forecast_df, test_df=None, backtest_pred=None):
         y=df["Ventas"],
         mode="lines+markers",
         name="Histórico real",
-        line=dict(color="#1f77b4", width=3)
+        line=dict(width=3)
     ))
 
-    if test_df is not None and backtest_pred is not None:
+    if auto_forecast is not None:
         fig.add_trace(go.Scatter(
-            x=test_df["Fecha"],
-            y=backtest_pred,
+            x=auto_forecast["Fecha"],
+            y=auto_forecast["Forecast"],
             mode="lines+markers",
-            name="Backtest modelo ganador",
-            line=dict(color="#ff7f0e", width=3, dash="dash")
+            name="Forecast automático",
+            line=dict(width=3)
         ))
 
-    fig.add_trace(go.Scatter(
-        x=forecast_df["Fecha"],
-        y=forecast_df["Forecast"],
-        mode="lines+markers",
-        name="Forecast 18 meses",
-        line=dict(color="#2ca02c", width=3)
-    ))
+    if manual_forecast is not None:
+        fig.add_trace(go.Scatter(
+            x=manual_forecast["Fecha"],
+            y=manual_forecast["Forecast"],
+            mode="lines+markers",
+            name="Forecast modelo seleccionado",
+            line=dict(width=3, dash="dash")
+        ))
 
     fig.update_layout(
-        title="Histórico, backtesting y forecast",
+        title="Histórico y previsión a futuro",
         xaxis_title="Fecha",
         yaxis_title="Ventas",
         template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        height=520
+        height=520,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0
+        )
     )
 
     return fig
 
 
-# =========================
-# Sidebar
-# =========================
+# =========================================================
+# ESTADO INICIAL
+# =========================================================
+
+example_data = """Fecha\tVentas
+2025-01\t1200
+2025-02\t1350
+2025-03\t980
+2025-04\t1450
+2025-05\t1600
+2025-06\t1580
+2025-07\t1700
+2025-08\t900
+2025-09\t1250
+2025-10\t1400
+2025-11\t1550
+2025-12\t1900
+2026-01\t1300
+2026-02\t1450
+2026-03\t1500
+2026-04\t1650"""
+
+if "raw_data" not in st.session_state:
+    st.session_state["raw_data"] = example_data
+
+if "clear_counter" not in st.session_state:
+    st.session_state["clear_counter"] = 0
+
+if "result_ready" not in st.session_state:
+    st.session_state["result_ready"] = False
+
+if "df" not in st.session_state:
+    st.session_state["df"] = None
+
+if "results_df" not in st.session_state:
+    st.session_state["results_df"] = None
+
+if "best_model" not in st.session_state:
+    st.session_state["best_model"] = None
+
+if "best_metric" not in st.session_state:
+    st.session_state["best_metric"] = None
+
+if "best_metric_name" not in st.session_state:
+    st.session_state["best_metric_name"] = None
+
+if "train_df" not in st.session_state:
+    st.session_state["train_df"] = None
+
+if "test_df" not in st.session_state:
+    st.session_state["test_df"] = None
+
+if "mode" not in st.session_state:
+    st.session_state["mode"] = None
+
+
+def clear_history():
+    st.session_state["raw_data"] = ""
+    st.session_state["clear_counter"] += 1
+    st.session_state["result_ready"] = False
+    st.session_state["df"] = None
+    st.session_state["results_df"] = None
+    st.session_state["best_model"] = None
+    st.session_state["best_metric"] = None
+    st.session_state["best_metric_name"] = None
+    st.session_state["train_df"] = None
+    st.session_state["test_df"] = None
+    st.session_state["mode"] = None
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
 
 with st.sidebar:
     st.header("⚙️ Configuración")
 
     start_month = st.text_input(
-        "Mes inicial si pegas solo una columna",
+        "Mes inicial si pegas solo ventas",
         value="2025-01",
-        help="Formato recomendado: YYYY-MM. Solo se usa si pegas una única columna de ventas."
+        help="Formato recomendado: YYYY-MM"
     )
 
     horizon = st.number_input(
-        "Horizonte forecast",
+        "Horizonte de forecast",
         min_value=1,
         max_value=36,
         value=18,
@@ -866,69 +958,52 @@ with st.sidebar:
 
     st.markdown("---")
 
-    st.subheader("Librerías detectadas")
-
+    st.subheader("Estado de librerías")
     st.write(f"statsmodels: {'✅' if STATSMODELS_AVAILABLE else '❌'}")
     st.write(f"Prophet: {'✅' if PROPHET_AVAILABLE else '❌'}")
     st.write(f"LightGBM: {'✅' if LGBM_AVAILABLE else '❌'}")
     st.write(f"Plotly: {'✅' if PLOTLY_AVAILABLE else '❌'}")
 
 
-# =========================
-# Input area
-# =========================
-
-example_data = """Fecha\tVentas
-2025-01\t1200
-2025-02\t1350
-2025-03\t980
-2025-04\t1450
-2025-05\t1600
-2025-06\t1580
-2025-07\t1700
-2025-08\t900
-2025-09\t1250
-2025-10\t1400
-2025-11\t1550
-2025-12\t1900
-2026-01\t1300
-2026-02\t1450
-2026-03\t1500
-2026-04\t1650"""
-
-if "raw_data" not in st.session_state:
-    st.session_state["raw_data"] = example_data
+# =========================================================
+# ENTRADA PRINCIPAL
+# =========================================================
 
 st.subheader("1. Pega el histórico de ventas desde Excel")
 
 st.info(
     "Formato recomendado: dos columnas `Fecha` y `Ventas`. "
-    "También puedes pegar solo una columna de ventas; en ese caso se generarán fechas desde el mes inicial indicado."
+    "También puedes pegar solo una columna de ventas. "
+    "Con 16 meses o más se hará backtesting de los últimos 4 meses."
 )
 
 raw_data = st.text_area(
-    "Datos históricos",
+    "Histórico de ventas",
     value=st.session_state["raw_data"],
     height=280,
-    key="input_area"
+    key=f"input_area_{st.session_state['clear_counter']}"
 )
 
-col_btn_1, col_btn_2, col_btn_3 = st.columns([1, 1, 4])
+col1, col2 = st.columns([1, 1])
 
-with col_btn_1:
-    calculate = st.button("🚀 Calcular mejor forecast", type="primary")
+with col1:
+    calculate = st.button(
+        "🚀 Calcular mejor forecast",
+        type="primary",
+        use_container_width=True
+    )
 
-with col_btn_2:
-    clear = st.button("🧹 Limpiar")
+with col2:
+    st.button(
+        "🧹 Limpiar histórico",
+        on_click=clear_history,
+        use_container_width=True
+    )
 
-if clear:
-    st.session_state["raw_data"] = ""
-    st.rerun()
 
-
-# =========================
-# Main calculation
-# =========================
+# =========================================================
+# EJECUCION DEL CALCULO
+# =========================================================
 
 if calculate:
     try:
@@ -939,236 +1014,294 @@ if calculate:
 
         n_months = len(df)
 
-        st.subheader("2. Datos interpretados")
-
-        col_a, col_b, col_c = st.columns(3)
-
-        with col_a:
-            st.metric("Meses históricos", n_months)
-
-        with col_b:
-            st.metric("Desde", df["Fecha"].min().strftime("%Y-%m"))
-
-        with col_c:
-            st.metric("Hasta", df["Fecha"].max().strftime("%Y-%m"))
-
-        st.dataframe(df, use_container_width=True)
-
         if n_months < 12:
-            st.error(
-                "Histórico insuficiente. Se necesitan al menos 12 meses para generar una previsión mínima."
-            )
+            st.error("Se necesitan al menos 12 meses de histórico.")
             st.stop()
 
-        if n_months < 16:
-            st.warning(
-                "Hay entre 12 y 15 meses de histórico. "
-                "La app generará forecast, pero no puede hacer el backtesting completo 12+4."
-            )
+        st.session_state["df"] = df
 
-            selected_model, forecast_df = fallback_forecast_without_backtest(
-                df=df,
-                horizon=int(horizon)
-            )
+        if n_months >= 16:
+            best_model, best_metric, best_metric_name, results_df, train_df, test_df = run_backtesting(df)
 
-            st.subheader("3. Resultado forecast sin backtesting completo")
+            st.session_state["best_model"] = best_model
+            st.session_state["best_metric"] = best_metric
+            st.session_state["best_metric_name"] = best_metric_name
+            st.session_state["results_df"] = results_df
+            st.session_state["train_df"] = train_df
+            st.session_state["test_df"] = test_df
+            st.session_state["mode"] = "backtesting"
+            st.session_state["result_ready"] = True
 
-            c1, c2, c3 = st.columns(3)
-
-            with c1:
-                st.metric("Modelo usado", selected_model)
-
-            with c2:
-                st.metric("Backtesting", "No disponible")
-
-            with c3:
-                st.metric("Fiabilidad", "No evaluada")
-
-            fig = build_forecast_chart(df, forecast_df)
-
-            if fig is not None:
-                st.plotly_chart(fig, use_container_width=True)
-
-            st.subheader("4. Forecast generado")
-            st.dataframe(forecast_df, use_container_width=True)
-
-            csv = forecast_df.to_csv(index=False, sep=";").encode("utf-8-sig")
-
-            st.download_button(
-                label="⬇️ Descargar forecast CSV",
-                data=csv,
-                file_name="forecast_18_meses.csv",
-                mime="text/csv"
-            )
-
-            st.stop()
-
-        # Backtesting completo
-        best_model, best_metric, metric_name, results_df, train_df, test_df = run_backtest(df)
-
-        forecast_df = forecast_final(
-            df=df,
-            best_model=best_model,
-            horizon=int(horizon)
-        )
-
-        best_row = results_df[results_df["Modelo"] == best_model].iloc[0]
-
-        backtest_pred = np.array([
-            best_row["Backtest M+1"],
-            best_row["Backtest M+2"],
-            best_row["Backtest M+3"],
-            best_row["Backtest M+4"]
-        ])
-
-        reliability = reliability_label(best_metric)
-
-        st.subheader("3. Mejor modelo seleccionado")
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric("Modelo ganador", best_model)
-
-        with col2:
-            st.metric(metric_name, f"{best_metric:.2f}%")
-
-        with col3:
-            st.metric("Fiabilidad", reliability)
-
-        with col4:
-            st.metric("Horizonte forecast", f"{int(horizon)} meses")
-
-        st.caption(
-            "La fiabilidad se calcula según la métrica de selección del backtesting. "
-            "Si existen meses con venta real igual a cero, se usa sMAPE en lugar de MAPE."
-        )
-
-        st.subheader("4. Comparativa de modelos")
-
-        display_results = results_df.copy()
-
-        numeric_cols = [
-            "MAPE_%",
-            "sMAPE_%",
-            "WMAPE_%",
-            "Valor métrica selección",
-            "Backtest M+1",
-            "Backtest M+2",
-            "Backtest M+3",
-            "Backtest M+4"
-        ]
-
-        for col in numeric_cols:
-            if col in display_results.columns:
-                display_results[col] = display_results[col].round(2)
-
-        display_results = display_results.sort_values(
-            by=["Estado", "Valor métrica selección"],
-            ascending=[False, True]
-        )
-
-        st.dataframe(display_results, use_container_width=True)
-
-        st.subheader("5. Backtesting últimos 4 meses")
-
-        backtest_view = test_df.copy()
-        backtest_view["Forecast modelo ganador"] = backtest_pred
-        backtest_view["Error abs."] = np.abs(
-            backtest_view["Ventas"] - backtest_view["Forecast modelo ganador"]
-        )
-        backtest_view["Error %"] = np.where(
-            backtest_view["Ventas"] != 0,
-            backtest_view["Error abs."] / backtest_view["Ventas"] * 100,
-            np.nan
-        )
-
-        st.dataframe(backtest_view, use_container_width=True)
-
-        st.subheader("6. Gráfico histórico + backtesting + forecast")
-
-        fig = build_forecast_chart(
-            df=df,
-            forecast_df=forecast_df,
-            test_df=test_df,
-            backtest_pred=backtest_pred
-        )
-
-        if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.line_chart(
-                pd.concat([
-                    df.set_index("Fecha")["Ventas"].rename("Histórico"),
-                    forecast_df.set_index("Fecha")["Forecast"].rename("Forecast")
-                ], axis=1)
-            )
-
-        st.subheader("7. Forecast final")
-
-        st.dataframe(forecast_df, use_container_width=True)
-
-        # =========================
-        # Downloads
-        # =========================
-
-        st.subheader("8. Descargas")
-
-        col_down_1, col_down_2, col_down_3 = st.columns(3)
-
-        with col_down_1:
-            forecast_csv = forecast_df.to_csv(index=False, sep=";").encode("utf-8-sig")
-
-            st.download_button(
-                label="⬇️ Descargar forecast CSV",
-                data=forecast_csv,
-                file_name="forecast_18_meses.csv",
-                mime="text/csv"
-            )
-
-        with col_down_2:
-            models_csv = results_df.to_csv(index=False, sep=";").encode("utf-8-sig")
-
-            st.download_button(
-                label="⬇️ Descargar comparativa modelos CSV",
-                data=models_csv,
-                file_name="comparativa_modelos.csv",
-                mime="text/csv"
-            )
-
-        with col_down_3:
-            backtest_csv = backtest_view.to_csv(index=False, sep=";").encode("utf-8-sig")
-
-            st.download_button(
-                label="⬇️ Descargar backtesting CSV",
-                data=backtest_csv,
-                file_name="backtesting_4_meses.csv",
-                mime="text/csv"
-            )
-
-        # =========================
-        # Business warning
-        # =========================
-
-        st.markdown("---")
-        st.warning(
-            "Recomendación de negocio: revisar manualmente el forecast si existen lanzamientos, "
-            "promociones, roturas de stock, cambios de cliente, phase-out, cambios de fórmula, "
-            "ventas extraordinarias o restricciones de suministro."
-        )
+            st.session_state["best_model"] = None
+            st.session_state["best_metric"] = None
+            st.session_state["best_metric_name"] = None
+            st.session_state["results_df"] = None
+            st.session_state["train_df"] = None
+            st.session_state["test_df"] = None
+            st.session_state["mode"] = "no_backtesting"
+            st.session_state["result_ready"] = True
 
     except Exception as e:
+        st.session_state["result_ready"] = False
         st.error("No se ha podido calcular el forecast.")
         st.exception(e)
 
 
-# =========================
-# Footer
-# =========================
+# =========================================================
+# RENDERIZADO DE RESULTADOS
+# =========================================================
+
+if st.session_state["result_ready"] and st.session_state["df"] is not None:
+
+    df = st.session_state["df"]
+    n_months = len(df)
+
+    st.subheader("2. Datos interpretados")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.metric("Meses históricos", n_months)
+
+    with c2:
+        st.metric("Desde", df["Fecha"].min().strftime("%Y-%m"))
+
+    with c3:
+        st.metric("Hasta", df["Fecha"].max().strftime("%Y-%m"))
+
+    st.dataframe(df, use_container_width=True)
+
+    model_list = available_models(n_months)
+
+    if st.session_state["mode"] == "no_backtesting":
+
+        st.warning(
+            "Con menos de 16 meses no se puede hacer el backtesting 12+4. "
+            "La app puede calcular forecast, pero sin selección automática validada."
+        )
+
+        st.subheader("3. Selección de modelo manual")
+
+        default_model = "Holt amortiguado"
+
+        manual_model = st.selectbox(
+            "Selecciona un modelo específico",
+            model_list,
+            index=model_list.index(default_model) if default_model in model_list else 0
+        )
+
+        try:
+            manual_forecast = forecast_future(df, manual_model, int(horizon))
+
+            horizontal_df = pd.DataFrame([
+                make_horizontal_forecast(
+                    manual_forecast,
+                    "Manual sin backtesting completo",
+                    manual_model
+                )
+            ])
+
+            st.subheader("4. Forecast horizontal")
+
+            st.dataframe(horizontal_df, use_container_width=True)
+
+            fig = build_chart(df, auto_forecast=None, manual_forecast=manual_forecast)
+
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                chart_df = pd.concat([
+                    df.set_index("Fecha")["Ventas"].rename("Histórico"),
+                    manual_forecast.set_index("Fecha")["Forecast"].rename("Forecast manual")
+                ], axis=1)
+
+                st.line_chart(chart_df)
+
+            st.subheader("5. Descarga")
+
+            csv_horizontal = horizontal_df.to_csv(index=False, sep=";").encode("utf-8-sig")
+
+            st.download_button(
+                "⬇️ Descargar forecast horizontal CSV",
+                data=csv_horizontal,
+                file_name="forecast_horizontal.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        except Exception as e:
+            st.error("No se ha podido calcular el modelo manual seleccionado.")
+            st.exception(e)
+
+    if st.session_state["mode"] == "backtesting":
+
+        best_model = st.session_state["best_model"]
+        best_metric = st.session_state["best_metric"]
+        best_metric_name = st.session_state["best_metric_name"]
+        results_df = st.session_state["results_df"]
+        test_df = st.session_state["test_df"]
+
+        st.subheader("3. Modelo automático seleccionado")
+
+        cc1, cc2, cc3 = st.columns(3)
+
+        with cc1:
+            st.metric("Modelo ganador", best_model)
+
+        with cc2:
+            st.metric(best_metric_name, f"{best_metric:.2f}%")
+
+        with cc3:
+            st.metric("Fiabilidad", reliability_label(best_metric))
+
+        st.caption(
+            "Si los últimos 4 meses contienen ventas reales igual a cero, la selección usa sMAPE. "
+            "Si no hay ceros, usa MAPE."
+        )
+
+        st.subheader("4. Selección de modelo alternativo")
+
+        manual_model = st.selectbox(
+            "Selecciona un modelo específico para comparar",
+            model_list,
+            index=model_list.index(best_model) if best_model in model_list else 0
+        )
+
+        try:
+            auto_forecast = forecast_future(df, best_model, int(horizon))
+            manual_forecast = forecast_future(df, manual_model, int(horizon))
+
+            st.subheader("5. Forecast horizontal automático y manual")
+
+            horizontal_rows = [
+                make_horizontal_forecast(
+                    auto_forecast,
+                    "Automático",
+                    best_model
+                ),
+                make_horizontal_forecast(
+                    manual_forecast,
+                    "Manual seleccionado",
+                    manual_model
+                )
+            ]
+
+            horizontal_df = pd.DataFrame(horizontal_rows)
+
+            st.dataframe(horizontal_df, use_container_width=True)
+
+            st.subheader("6. Comparativa de modelos en backtesting")
+
+            display_results = results_df.copy()
+
+            for col in ["MAPE_%", "sMAPE_%", "WMAPE_%", "Valor métrica selección"]:
+                if col in display_results.columns:
+                    display_results[col] = display_results[col].round(2)
+
+            display_results = display_results.sort_values(
+                by=["Estado", "Valor métrica selección"],
+                ascending=[False, True]
+            )
+
+            st.dataframe(display_results, use_container_width=True)
+
+            st.subheader("7. Backtesting de los últimos 4 meses")
+
+            best_row = results_df[results_df["Modelo"] == best_model].iloc[0]
+
+            backtest_pred = np.array([
+                best_row["Backtest M+1"],
+                best_row["Backtest M+2"],
+                best_row["Backtest M+3"],
+                best_row["Backtest M+4"]
+            ])
+
+            backtest_view = test_df.copy()
+            backtest_view["Forecast modelo ganador"] = backtest_pred
+            backtest_view["Error absoluto"] = np.abs(
+                backtest_view["Ventas"] - backtest_view["Forecast modelo ganador"]
+            )
+            backtest_view["Error %"] = np.where(
+                backtest_view["Ventas"] != 0,
+                backtest_view["Error absoluto"] / backtest_view["Ventas"] * 100,
+                np.nan
+            )
+
+            st.dataframe(backtest_view, use_container_width=True)
+
+            st.subheader("8. Gráfico comparativo")
+
+            fig = build_chart(df, auto_forecast, manual_forecast)
+
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                chart_df = pd.concat([
+                    df.set_index("Fecha")["Ventas"].rename("Histórico"),
+                    auto_forecast.set_index("Fecha")["Forecast"].rename("Forecast automático"),
+                    manual_forecast.set_index("Fecha")["Forecast"].rename("Forecast manual")
+                ], axis=1)
+
+                st.line_chart(chart_df)
+
+            st.subheader("9. Descargas")
+
+            d1, d2, d3 = st.columns(3)
+
+            with d1:
+                csv_horizontal = horizontal_df.to_csv(index=False, sep=";").encode("utf-8-sig")
+
+                st.download_button(
+                    "⬇️ Forecast horizontal CSV",
+                    data=csv_horizontal,
+                    file_name="forecast_horizontal.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+            with d2:
+                csv_models = results_df.to_csv(index=False, sep=";").encode("utf-8-sig")
+
+                st.download_button(
+                    "⬇️ Comparativa modelos CSV",
+                    data=csv_models,
+                    file_name="comparativa_modelos.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+            with d3:
+                csv_backtest = backtest_view.to_csv(index=False, sep=";").encode("utf-8-sig")
+
+                st.download_button(
+                    "⬇️ Backtesting CSV",
+                    data=csv_backtest,
+                    file_name="backtesting_ultimos_4_meses.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+            st.markdown("---")
+
+            st.warning(
+                "Revisión recomendada de Demand Planning: valida manualmente el forecast si existen "
+                "lanzamientos, promociones, roturas de stock, ventas extraordinarias, phase-out, "
+                "cambios de cliente, cambios de distribución o restricciones de suministro."
+            )
+
+        except Exception as e:
+            st.error("No se ha podido calcular el forecast con el modelo seleccionado.")
+            st.exception(e)
+
+
+# =========================================================
+# FOOTER
+# =========================================================
 
 st.markdown("---")
 
 st.caption(
-    "MVP de forecasting automático. Selecciona el modelo con mejor comportamiento en backtesting "
-    "y genera una previsión futura usando todo el histórico disponible."
+    "MVP de forecasting automático. Compara modelos mediante backtesting, selecciona el mejor "
+    "y permite calcular una alternativa manual seleccionada por el usuario."
 )
