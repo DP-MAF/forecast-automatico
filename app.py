@@ -42,15 +42,15 @@ except Exception:
 # =========================================================
 
 st.set_page_config(
-    page_title="Forecast automatico de ventas",
+    page_title="Forecast automático de ventas",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 Forecast automatico de ventas")
+st.title("📈 Forecast automático de ventas")
 st.caption(
-    "Aplicacion para seleccionar automaticamente el mejor modelo de prevision "
-    "mediante backtesting walk-forward y generar una prevision de 18 meses."
+    "Aplicación para seleccionar automáticamente el mejor modelo de previsión "
+    "mediante backtesting walk-forward y generar una previsión de 18 meses."
 )
 
 
@@ -59,15 +59,6 @@ st.caption(
 # =========================================================
 
 def clean_number(value):
-    """
-    Convierte numeros pegados desde Excel.
-    Soporta:
-    1.234,56
-    1234,56
-    1,234.56
-    1234.56
-    """
-
     if pd.isna(value):
         return np.nan
 
@@ -109,21 +100,14 @@ def parse_pasted_data(raw_text, start_month):
     Permite dos formatos:
     1. Fecha + Ventas
     2. Solo Ventas
-
-    Ejemplo recomendado desde Excel:
-    Fecha    Ventas
-    2025-01  1200
-    2025-02  1350
     """
 
     if raw_text is None or raw_text.strip() == "":
         raise ValueError("No se han introducido datos.")
 
     raw_text = raw_text.strip()
-
     df = None
 
-    # 1. Intentar tabulador, formato habitual al pegar desde Excel
     try:
         temp = pd.read_csv(io.StringIO(raw_text), sep="\t", header=None, engine="python")
         if temp.shape[1] >= 2:
@@ -131,7 +115,6 @@ def parse_pasted_data(raw_text, start_month):
     except Exception:
         pass
 
-    # 2. Intentar punto y coma
     if df is None:
         try:
             temp = pd.read_csv(io.StringIO(raw_text), sep=";", header=None, engine="python")
@@ -140,7 +123,6 @@ def parse_pasted_data(raw_text, start_month):
         except Exception:
             pass
 
-    # 3. Intentar coma solo si parece Fecha + Ventas
     if df is None:
         try:
             temp = pd.read_csv(io.StringIO(raw_text), sep=",", header=None, engine="python")
@@ -149,7 +131,6 @@ def parse_pasted_data(raw_text, start_month):
         except Exception:
             pass
 
-    # 4. Si no, tratar como una sola columna
     if df is None:
         lines = raw_text.splitlines()
         df = pd.DataFrame(lines)
@@ -165,7 +146,7 @@ def parse_pasted_data(raw_text, start_month):
         df = df.iloc[1:].reset_index(drop=True)
 
     if df.empty:
-        raise ValueError("Despues de quitar la cabecera, no quedan datos validos.")
+        raise ValueError("Después de quitar la cabecera, no quedan datos válidos.")
 
     if df.shape[1] >= 2:
         date_text = df.iloc[:, 0].astype(str).str.strip()
@@ -225,10 +206,6 @@ def parse_pasted_data(raw_text, start_month):
 
 
 def complete_monthly_series(df):
-    """
-    Completa meses faltantes con cero.
-    """
-
     full_dates = pd.date_range(
         start=df["Fecha"].min(),
         end=df["Fecha"].max(),
@@ -284,10 +261,6 @@ def wmape(actual, forecast):
 
 
 def postprocess_forecast(values):
-    """
-    Evita negativos y redondea a unidades.
-    """
-
     arr = np.array(values, dtype=float)
     arr = np.where(np.isnan(arr), 0, arr)
     arr = np.maximum(arr, 0)
@@ -295,18 +268,258 @@ def postprocess_forecast(values):
     return np.round(arr, 0).astype(int)
 
 
-def reliability_label(metric_value):
-    if pd.isna(metric_value):
+# =========================================================
+# CLASIFICACION DE DEMANDA Y CONFIABILIDAD
+# =========================================================
+
+def calculate_cv(y):
+    y = pd.Series(y).astype(float)
+
+    mean_value = y.mean()
+
+    if mean_value == 0 or pd.isna(mean_value):
+        return np.nan
+
+    return y.std(ddof=0) / mean_value
+
+
+def calculate_trend_strength(df):
+    y = df["Ventas"].astype(float).values
+
+    if len(y) < 6:
+        return 0
+
+    x = np.arange(len(y))
+
+    try:
+        slope = np.polyfit(x, y, 1)[0]
+    except Exception:
+        return 0
+
+    mean_value = np.mean(y)
+
+    if mean_value == 0:
+        return 0
+
+    monthly_trend_pct = slope / mean_value
+
+    return monthly_trend_pct
+
+
+def detect_seasonality(df):
+    """
+    Detecta estacionalidad de forma simple.
+    Solo se evalúa si hay al menos 24 meses.
+    """
+
+    if len(df) < 24:
+        return False, np.nan
+
+    temp = df.copy()
+    temp["MesCalendario"] = temp["Fecha"].dt.month
+
+    month_avg = temp.groupby("MesCalendario")["Ventas"].mean()
+
+    global_avg = temp["Ventas"].mean()
+
+    if global_avg == 0:
+        return False, np.nan
+
+    seasonal_strength = month_avg.std(ddof=0) / global_avg
+
+    is_seasonal = seasonal_strength >= 0.20
+
+    return is_seasonal, seasonal_strength
+
+
+def classify_demand(df):
+    """
+    Clasificación automática sencilla de la serie.
+
+    La clasificación es orientativa y no sustituye la revisión de negocio.
+    """
+
+    y = df["Ventas"].astype(float)
+
+    n_months = len(df)
+    mean_value = y.mean()
+    cv = calculate_cv(y)
+    zero_ratio = (y == 0).mean()
+    trend_pct = calculate_trend_strength(df)
+    is_seasonal, seasonal_strength = detect_seasonality(df)
+
+    first_4_avg = y.head(min(4, n_months)).mean()
+    last_4_avg = y.tail(min(4, n_months)).mean()
+
+    last_3_avg = y.tail(min(3, n_months)).mean()
+    previous_6_avg = y.iloc[-9:-3].mean() if n_months >= 9 else y.iloc[:-3].mean()
+
+    demand_type = "Sin patrón dominante"
+    explanation = "La serie no muestra un patrón claramente dominante con las reglas actuales."
+    recommendation = "Usar el forecast automático y complementar con revisión de negocio."
+
+    if mean_value == 0:
+        demand_type = "Sin demanda histórica"
+        explanation = "Todos los valores históricos son cero o la media histórica es cero."
+        recommendation = "No usar forecast estadístico sin información adicional de mercado, cliente o lanzamiento."
+
+    elif zero_ratio >= 0.40:
+        demand_type = "Intermitente"
+        explanation = "La serie tiene una proporción elevada de meses con venta cero."
+        recommendation = "Revisar con criterio de baja rotación, pedidos puntuales o demanda irregular."
+
+    elif n_months >= 8 and first_4_avg > 0 and last_4_avg >= first_4_avg * 1.8 and trend_pct > 0.03:
+        demand_type = "Posible lanzamiento"
+        explanation = "La demanda reciente es claramente superior a los primeros meses y muestra tendencia positiva."
+        recommendation = "Validar con información comercial, pipeline, clientes nuevos o ramp-up."
+
+    elif n_months >= 9 and previous_6_avg > 0 and last_3_avg <= previous_6_avg * 0.50 and trend_pct < -0.03:
+        demand_type = "Posible phase-out"
+        explanation = "La demanda reciente cae claramente frente al periodo anterior y muestra tendencia negativa."
+        recommendation = "Validar si existe descatalogación, sustitución, pérdida de cliente o reducción de distribución."
+
+    elif is_seasonal:
+        demand_type = "Estacional"
+        explanation = "La serie muestra diferencias relevantes entre meses calendario."
+        recommendation = "Priorizar modelos estacionales si hay histórico suficiente y revisar eventos comerciales."
+
+    elif not pd.isna(cv) and cv <= 0.20:
+        demand_type = "Estable"
+        explanation = "La variabilidad histórica es baja en relación con la media."
+        recommendation = "La previsión estadística suele ser más defendible, salvo cambios comerciales futuros."
+
+    elif not pd.isna(cv) and cv >= 0.70:
+        demand_type = "Volátil"
+        explanation = "La variabilidad histórica es elevada en relación con la media."
+        recommendation = "Revisar causas de variabilidad: promociones, roturas, pedidos extraordinarios o baja frecuencia."
+
+    elif trend_pct >= 0.03:
+        demand_type = "Tendencia creciente"
+        explanation = "La serie muestra una pendiente positiva relevante."
+        recommendation = "Validar si el crecimiento se mantiene por distribución, clientes, precio o mercado."
+
+    elif trend_pct <= -0.03:
+        demand_type = "Tendencia decreciente"
+        explanation = "La serie muestra una pendiente negativa relevante."
+        recommendation = "Validar si existe pérdida de distribución, sustitución, phase-out o menor demanda estructural."
+
+    summary = {
+        "Tipo demanda": demand_type,
+        "Explicación": explanation,
+        "Recomendación": recommendation,
+        "CV": cv,
+        "Meses con venta cero_%": zero_ratio * 100,
+        "Tendencia mensual_%": trend_pct * 100,
+        "Estacionalidad detectada": "Sí" if is_seasonal else "No",
+        "Fuerza estacional": seasonal_strength
+    }
+
+    return summary
+
+
+def reliability_band(score):
+    if pd.isna(score):
         return "No calculable"
 
-    if metric_value <= 15:
+    if score >= 90:
+        return "Muy alta"
+    elif score >= 75:
         return "Alta"
-    elif metric_value <= 30:
+    elif score >= 60:
         return "Media"
-    elif metric_value <= 50:
+    elif score >= 40:
         return "Baja"
     else:
         return "Muy baja"
+
+
+def calculate_history_score(n_months):
+    """
+    Score por cantidad de histórico.
+    """
+
+    if n_months < 16:
+        return 30
+
+    if n_months >= 48:
+        return 100
+
+    if n_months >= 36:
+        return 85 + (n_months - 36) * (15 / 12)
+
+    if n_months >= 24:
+        return 70 + (n_months - 24) * (15 / 12)
+
+    return 50 + (n_months - 16) * (20 / 8)
+
+
+def calculate_stability_score(cv):
+    """
+    Score de estabilidad basado en coeficiente de variación.
+
+    CV <= 0.20: muy estable
+    CV >= 1.00: muy volátil
+    """
+
+    if pd.isna(cv):
+        return 0
+
+    if cv <= 0.20:
+        return 100
+
+    if cv >= 1.00:
+        return 0
+
+    return 100 * (1 - ((cv - 0.20) / 0.80))
+
+
+def calculate_error_score(metric_value):
+    """
+    Score de error:
+    0% error = 100 puntos
+    50% error o más = 0 puntos
+    """
+
+    if pd.isna(metric_value):
+        return 0
+
+    if metric_value >= 50:
+        return 0
+
+    return max(0, 100 - (metric_value * 2))
+
+
+def calculate_forecast_reliability_index(df, metric_value):
+    """
+    Índice de Confiabilidad Forecast.
+
+    Combina:
+    50% precisión histórica del modelo
+    30% estabilidad de la demanda
+    20% cantidad de histórico
+    """
+
+    cv = calculate_cv(df["Ventas"])
+    n_months = len(df)
+
+    error_score = calculate_error_score(metric_value)
+    stability_score = calculate_stability_score(cv)
+    history_score = calculate_history_score(n_months)
+
+    fri = (
+        error_score * 0.50 +
+        stability_score * 0.30 +
+        history_score * 0.20
+    )
+
+    return {
+        "FRI": round(float(fri), 1),
+        "Banda": reliability_band(fri),
+        "Score error": round(float(error_score), 1),
+        "Score estabilidad": round(float(stability_score), 1),
+        "Score histórico": round(float(history_score), 1),
+        "CV": cv
+    }
 
 
 # =========================================================
@@ -319,7 +532,7 @@ def forecast_naive(y, horizon):
 
 def forecast_moving_average(y, horizon, window):
     if len(y) < window:
-        raise ValueError(f"No hay suficientes datos para media movil {window}.")
+        raise ValueError(f"No hay suficientes datos para media móvil {window}.")
 
     return np.repeat(y.iloc[-window:].mean(), horizon)
 
@@ -335,7 +548,7 @@ def forecast_seasonal_naive_12(y, horizon):
 
 def forecast_ses(y, horizon):
     if not STATSMODELS_AVAILABLE:
-        raise ValueError("statsmodels no esta instalado.")
+        raise ValueError("statsmodels no está instalado.")
 
     model = SimpleExpSmoothing(
         y,
@@ -347,7 +560,7 @@ def forecast_ses(y, horizon):
 
 def forecast_holt(y, horizon, damped=False):
     if not STATSMODELS_AVAILABLE:
-        raise ValueError("statsmodels no esta instalado.")
+        raise ValueError("statsmodels no está instalado.")
 
     model = Holt(
         y,
@@ -360,7 +573,7 @@ def forecast_holt(y, horizon, damped=False):
 
 def forecast_holt_winters(y, horizon):
     if not STATSMODELS_AVAILABLE:
-        raise ValueError("statsmodels no esta instalado.")
+        raise ValueError("statsmodels no está instalado.")
 
     if len(y) < 24:
         raise ValueError("Holt-Winters estacional necesita al menos 24 meses.")
@@ -378,7 +591,7 @@ def forecast_holt_winters(y, horizon):
 
 def forecast_arima_simple(y, horizon):
     if not STATSMODELS_AVAILABLE:
-        raise ValueError("statsmodels no esta instalado.")
+        raise ValueError("statsmodels no está instalado.")
 
     candidate_orders = [
         (0, 1, 0),
@@ -416,7 +629,7 @@ def forecast_arima_simple(y, horizon):
 
 def forecast_prophet(y, dates, horizon):
     if not PROPHET_AVAILABLE:
-        raise ValueError("Prophet no esta instalado.")
+        raise ValueError("Prophet no está instalado.")
 
     df_prophet = pd.DataFrame({
         "ds": pd.to_datetime(dates),
@@ -506,7 +719,7 @@ def make_lgbm_training_table(values, dates):
 
 def forecast_lgbm(y, dates, horizon):
     if not LGBM_AVAILABLE:
-        raise ValueError("LightGBM no esta instalado.")
+        raise ValueError("LightGBM no está instalado.")
 
     if len(y) < 12:
         raise ValueError("LightGBM necesita al menos 12 meses.")
@@ -573,22 +786,10 @@ def forecast_lgbm(y, dates, horizon):
 # =========================================================
 
 def available_models(n_months):
-    """
-    Modelos incluidos en la herramienta:
-    1. Naive
-    2. Media movil 3/6
-    3. Suavizado exponencial
-    4. Holt
-    5. ARIMA simple
-    6. Prophet
-    7. LightGBM
-    8. Estacionales si hay >=24 meses
-    """
-
     models = [
         "Naive",
-        "Media movil 3 meses",
-        "Media movil 6 meses",
+        "Media móvil 3 meses",
+        "Media móvil 6 meses",
         "Suavizado exponencial",
         "Holt",
         "Holt amortiguado",
@@ -610,10 +811,10 @@ def run_model(model_name, y, dates, horizon):
     if model_name == "Naive":
         return forecast_naive(y, horizon)
 
-    if model_name == "Media movil 3 meses":
+    if model_name == "Media móvil 3 meses":
         return forecast_moving_average(y, horizon, 3)
 
-    if model_name == "Media movil 6 meses":
+    if model_name == "Media móvil 6 meses":
         return forecast_moving_average(y, horizon, 6)
 
     if model_name == "Suavizado exponencial":
@@ -644,15 +845,10 @@ def run_model(model_name, y, dates, horizon):
 
 
 def complexity_rank(model_name):
-    """
-    Para desempates.
-    Si dos modelos tienen metrica similar, se prioriza el modelo mas simple.
-    """
-
     ranks = {
         "Naive": 1,
-        "Media movil 3 meses": 2,
-        "Media movil 6 meses": 3,
+        "Media móvil 3 meses": 2,
+        "Media móvil 6 meses": 3,
         "Naive estacional 12 meses": 4,
         "Suavizado exponencial": 5,
         "Holt": 6,
@@ -667,15 +863,10 @@ def complexity_rank(model_name):
 
 
 def minimum_training_months_for_model(model_name):
-    """
-    Meses minimos de entrenamiento necesarios por modelo.
-    Se usa para decidir si un modelo puede participar en el backtesting walk-forward.
-    """
-
     minimums = {
         "Naive": 1,
-        "Media movil 3 meses": 3,
-        "Media movil 6 meses": 6,
+        "Media móvil 3 meses": 3,
+        "Media móvil 6 meses": 6,
         "Suavizado exponencial": 6,
         "Holt": 8,
         "Holt amortiguado": 8,
@@ -690,14 +881,6 @@ def minimum_training_months_for_model(model_name):
 
 
 def backtest_candidate_models(n_months):
-    """
-    Selecciona los modelos que pueden participar en el backtesting.
-
-    El primer entrenamiento usa n_months - 4 meses.
-    Por tanto, solo participan modelos que tengan suficiente historico
-    en ese primer corte.
-    """
-
     first_train_size = n_months - 4
     candidates = []
 
@@ -715,19 +898,6 @@ def backtest_candidate_models(n_months):
 # =========================================================
 
 def run_backtesting(df):
-    """
-    Backtesting correcto tipo walk-forward.
-
-    Procedimiento:
-    1. Se reservan los ultimos 4 meses como test.
-    2. Para cada uno de esos 4 meses:
-       - se entrena con todos los datos reales disponibles hasta el mes anterior;
-       - se predice solo 1 mes hacia adelante;
-       - se compara contra el valor real.
-    3. Se calculan MAPE, sMAPE y WMAPE sobre las 4 predicciones.
-    4. Se selecciona el modelo con menor error.
-    """
-
     n_months = len(df)
 
     if n_months < 16:
@@ -750,13 +920,11 @@ def run_backtesting(df):
         for i in range(test_start_index, n_months):
 
             try:
-                # Entrenamiento expandido hasta el mes anterior al que se quiere predecir
                 train_i = df.iloc[:i].copy()
 
                 y_train_i = train_i["Ventas"]
                 dates_train_i = train_i["Fecha"]
 
-                # Prediccion de solo 1 mes hacia adelante
                 pred_i = run_model(
                     model_name=model_name,
                     y=y_train_i,
@@ -778,8 +946,8 @@ def run_backtesting(df):
                 "MAPE_%": np.nan,
                 "sMAPE_%": np.nan,
                 "WMAPE_%": np.nan,
-                "Metrica seleccion": "",
-                "Valor metrica seleccion": np.nan,
+                "Métrica selección": "",
+                "Valor métrica selección": np.nan,
                 "Backtest M+1": np.nan,
                 "Backtest M+2": np.nan,
                 "Backtest M+3": np.nan,
@@ -808,8 +976,8 @@ def run_backtesting(df):
             "MAPE_%": model_mape,
             "sMAPE_%": model_smape,
             "WMAPE_%": model_wmape,
-            "Metrica seleccion": selection_metric_name,
-            "Valor metrica seleccion": selection_metric_value,
+            "Métrica selección": selection_metric_name,
+            "Valor métrica selección": selection_metric_value,
             "Backtest M+1": pred[0],
             "Backtest M+2": pred[1],
             "Backtest M+3": pred[2],
@@ -822,22 +990,22 @@ def run_backtesting(df):
 
     valid = results[
         (results["Estado"] == "OK") &
-        (~results["Valor metrica seleccion"].isna())
+        (~results["Valor métrica selección"].isna())
     ].copy()
 
     if valid.empty:
-        raise ValueError("Ningun modelo ha podido calcularse correctamente en backtesting walk-forward.")
+        raise ValueError("Ningún modelo ha podido calcularse correctamente en backtesting walk-forward.")
 
     valid["Complejidad"] = valid["Modelo"].apply(complexity_rank)
 
     valid = valid.sort_values(
-        by=["Valor metrica seleccion", "Complejidad"],
+        by=["Valor métrica selección", "Complejidad"],
         ascending=[True, True]
     )
 
     best_model = valid.iloc[0]["Modelo"]
-    best_metric = valid.iloc[0]["Valor metrica seleccion"]
-    best_metric_name = valid.iloc[0]["Metrica seleccion"]
+    best_metric = valid.iloc[0]["Valor métrica selección"]
+    best_metric_name = valid.iloc[0]["Métrica selección"]
 
     train = df.iloc[:test_start_index].copy()
 
@@ -845,11 +1013,6 @@ def run_backtesting(df):
 
 
 def forecast_future(df, model_name, horizon):
-    """
-    Forecast futuro definitivo.
-    Despues de seleccionar el mejor modelo, se reentrena con todo el historico disponible.
-    """
-
     pred = run_model(
         model_name=model_name,
         y=df["Ventas"],
@@ -894,7 +1057,7 @@ def build_chart(df, auto_forecast=None, manual_forecast=None):
         x=df["Fecha"],
         y=df["Ventas"],
         mode="lines+markers",
-        name="Historico real",
+        name="Histórico real",
         line=dict(width=3)
     ))
 
@@ -903,7 +1066,7 @@ def build_chart(df, auto_forecast=None, manual_forecast=None):
             x=auto_forecast["Fecha"],
             y=auto_forecast["Forecast"],
             mode="lines+markers",
-            name="Forecast automatico",
+            name="Forecast automático",
             line=dict(width=3)
         ))
 
@@ -917,7 +1080,7 @@ def build_chart(df, auto_forecast=None, manual_forecast=None):
         ))
 
     fig.update_layout(
-        title="Historico y prevision a futuro",
+        title="Histórico y previsión a futuro",
         xaxis_title="Fecha",
         yaxis_title="Ventas",
         template="plotly_white",
@@ -1009,7 +1172,7 @@ def clear_history():
 # =========================================================
 
 with st.sidebar:
-    st.header("⚙️ Configuracion")
+    st.header("⚙️ Configuración")
 
     start_month = st.text_input(
         "Mes inicial si pegas solo ventas",
@@ -1032,19 +1195,19 @@ with st.sidebar:
     st.markdown(
         """
         - Naive
-        - Media movil 3/6
+        - Media móvil 3/6
         - Suavizado exponencial
         - Holt
         - ARIMA simple
         - Prophet
         - LightGBM
-        - Estacionales si hay 24 meses o mas
+        - Estacionales si hay 24 meses o más
         """
     )
 
     st.markdown("---")
 
-    st.subheader("Estado de librerias")
+    st.subheader("Estado de librerías")
     st.write(f"statsmodels: {'✅' if STATSMODELS_AVAILABLE else '❌'}")
     st.write(f"Prophet: {'✅' if PROPHET_AVAILABLE else '❌'}")
     st.write(f"LightGBM: {'✅' if LGBM_AVAILABLE else '❌'}")
@@ -1055,16 +1218,16 @@ with st.sidebar:
 # ENTRADA PRINCIPAL
 # =========================================================
 
-st.subheader("1. Pega el historico de ventas desde Excel")
+st.subheader("1. Pega el histórico de ventas desde Excel")
 
 st.info(
     "Formato recomendado: dos columnas `Fecha` y `Ventas`. "
-    "Tambien puedes pegar solo una columna de ventas. "
-    "Con 16 meses o mas se hara backtesting walk-forward de los ultimos 4 meses."
+    "También puedes pegar solo una columna de ventas. "
+    "Con 16 meses o más se hará backtesting walk-forward de los últimos 4 meses."
 )
 
 raw_data = st.text_area(
-    "Historico de ventas",
+    "Histórico de ventas",
     value=st.session_state["raw_data"],
     height=280,
     key=f"input_area_{st.session_state['clear_counter']}"
@@ -1081,7 +1244,7 @@ with col1:
 
 with col2:
     st.button(
-        "🧹 Limpiar historico",
+        "🧹 Limpiar histórico",
         on_click=clear_history,
         use_container_width=True
     )
@@ -1101,7 +1264,7 @@ if calculate:
         n_months = len(df)
 
         if n_months < 12:
-            st.error("Se necesitan al menos 12 meses de historico.")
+            st.error("Se necesitan al menos 12 meses de histórico.")
             st.stop()
 
         st.session_state["df"] = df
@@ -1143,12 +1306,14 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
     df = st.session_state["df"]
     n_months = len(df)
 
+    demand_summary = classify_demand(df)
+
     st.subheader("2. Datos interpretados")
 
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        st.metric("Meses historicos", n_months)
+        st.metric("Meses históricos", n_months)
 
     with c2:
         st.metric("Desde", df["Fecha"].min().strftime("%Y-%m"))
@@ -1158,21 +1323,45 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
 
     st.dataframe(df, use_container_width=True)
 
+    st.subheader("3. Clasificación automática de la demanda")
+
+    d1, d2, d3, d4 = st.columns(4)
+
+    with d1:
+        st.metric("Tipo de demanda", demand_summary["Tipo demanda"])
+
+    with d2:
+        cv_value = demand_summary["CV"]
+        st.metric("CV", "No calculable" if pd.isna(cv_value) else f"{cv_value:.2f}")
+
+    with d3:
+        st.metric("Meses con venta cero", f"{demand_summary['Meses con venta cero_%']:.1f}%")
+
+    with d4:
+        st.metric("Tendencia mensual", f"{demand_summary['Tendencia mensual_%']:.1f}%")
+
+    st.info(demand_summary["Explicación"])
+    st.warning(demand_summary["Recomendación"])
+
+    with st.expander("Ver detalle de clasificación de demanda"):
+        classification_detail = pd.DataFrame([demand_summary])
+        st.dataframe(classification_detail, use_container_width=True)
+
     model_list = available_models(n_months)
 
     if st.session_state["mode"] == "no_backtesting":
 
         st.warning(
             "Con menos de 16 meses no se puede hacer el backtesting 12+4. "
-            "La app puede calcular forecast, pero sin seleccion automatica validada."
+            "La app puede calcular forecast, pero sin selección automática validada."
         )
 
-        st.subheader("3. Seleccion de modelo manual")
+        st.subheader("4. Selección de modelo manual")
 
         default_model = "Holt amortiguado"
 
         manual_model = st.selectbox(
-            "Selecciona un modelo especifico",
+            "Selecciona un modelo específico",
             model_list,
             index=model_list.index(default_model) if default_model in model_list else 0
         )
@@ -1188,7 +1377,7 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
                 )
             ])
 
-            st.subheader("4. Forecast horizontal")
+            st.subheader("5. Forecast horizontal")
 
             st.dataframe(horizontal_df, use_container_width=True)
 
@@ -1198,13 +1387,13 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 chart_df = pd.concat([
-                    df.set_index("Fecha")["Ventas"].rename("Historico"),
+                    df.set_index("Fecha")["Ventas"].rename("Histórico"),
                     manual_forecast.set_index("Fecha")["Forecast"].rename("Forecast manual")
                 ], axis=1)
 
                 st.line_chart(chart_df)
 
-            st.subheader("5. Descarga")
+            st.subheader("6. Descarga")
 
             csv_horizontal = horizontal_df.to_csv(index=False, sep=";").encode("utf-8-sig")
 
@@ -1228,9 +1417,11 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
         results_df = st.session_state["results_df"]
         test_df = st.session_state["test_df"]
 
-        st.subheader("3. Modelo automatico seleccionado")
+        reliability = calculate_forecast_reliability_index(df, best_metric)
 
-        cc1, cc2, cc3 = st.columns(3)
+        st.subheader("4. Modelo automático seleccionado")
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
 
         with cc1:
             st.metric("Modelo ganador", best_model)
@@ -1239,17 +1430,55 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
             st.metric(best_metric_name, f"{best_metric:.2f}%")
 
         with cc3:
-            st.metric("Fiabilidad", reliability_label(best_metric))
+            st.metric("Confiabilidad", f"{reliability['FRI']}/100")
+
+        with cc4:
+            st.metric("Nivel", reliability["Banda"])
 
         st.caption(
-            "La seleccion se basa en backtesting walk-forward. Cada uno de los ultimos 4 meses "
+            "El Índice de Confiabilidad Forecast combina precisión histórica del modelo, "
+            "estabilidad de la demanda y cantidad de histórico disponible."
+        )
+
+        with st.expander("¿Cómo se calcula el Índice de Confiabilidad Forecast?"):
+            st.markdown(
+                """
+                El índice va de **0 a 100** y se calcula combinando tres factores:
+                
+                - **50% Precisión histórica del modelo**: basada en el error del backtesting.
+                - **30% Estabilidad de la demanda**: basada en el coeficiente de variación.
+                - **20% Cantidad de histórico disponible**: más meses históricos aportan mayor robustez.
+                
+                Interpretación:
+                
+                - **90-100**: Muy alta
+                - **75-89**: Alta
+                - **60-74**: Media
+                - **40-59**: Baja
+                - **0-39**: Muy baja
+                """
+            )
+
+            reliability_detail = pd.DataFrame([{
+                "Índice Confiabilidad": reliability["FRI"],
+                "Nivel": reliability["Banda"],
+                "Score error": reliability["Score error"],
+                "Score estabilidad": reliability["Score estabilidad"],
+                "Score histórico": reliability["Score histórico"],
+                "CV": reliability["CV"]
+            }])
+
+            st.dataframe(reliability_detail, use_container_width=True)
+
+        st.caption(
+            "La selección se basa en backtesting walk-forward. Cada uno de los últimos 4 meses "
             "se predice a 1 mes vista, reentrenando con los datos reales disponibles hasta el mes anterior."
         )
 
-        st.subheader("4. Seleccion de modelo alternativo")
+        st.subheader("5. Selección de modelo alternativo")
 
         manual_model = st.selectbox(
-            "Selecciona un modelo especifico para comparar",
+            "Selecciona un modelo específico para comparar",
             model_list,
             index=model_list.index(best_model) if best_model in model_list else 0
         )
@@ -1258,12 +1487,12 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
             auto_forecast = forecast_future(df, best_model, int(horizon))
             manual_forecast = forecast_future(df, manual_model, int(horizon))
 
-            st.subheader("5. Forecast horizontal automatico y manual")
+            st.subheader("6. Forecast horizontal automático y manual")
 
             horizontal_rows = [
                 make_horizontal_forecast(
                     auto_forecast,
-                    "Automatico",
+                    "Automático",
                     best_model
                 ),
                 make_horizontal_forecast(
@@ -1277,26 +1506,26 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
 
             st.dataframe(horizontal_df, use_container_width=True)
 
-            st.subheader("6. Comparativa de modelos en backtesting")
+            st.subheader("7. Comparativa de modelos en backtesting")
 
             display_results = results_df.copy()
 
-            for col in ["MAPE_%", "sMAPE_%", "WMAPE_%", "Valor metrica seleccion"]:
+            for col in ["MAPE_%", "sMAPE_%", "WMAPE_%", "Valor métrica selección"]:
                 if col in display_results.columns:
                     display_results[col] = display_results[col].round(2)
 
             display_results = display_results.sort_values(
-                by=["Estado", "Valor metrica seleccion"],
+                by=["Estado", "Valor métrica selección"],
                 ascending=[False, True]
             )
 
             st.dataframe(display_results, use_container_width=True)
 
-            st.subheader("7. Backtesting walk-forward de los ultimos 4 meses")
+            st.subheader("8. Backtesting walk-forward de los últimos 4 meses")
 
             st.caption(
-                "Ejemplo para media movil 3 meses: el primer mes de test usa los 3 meses reales anteriores; "
-                "el segundo mes de test ya incorpora el primer mes real de test; y asi sucesivamente."
+                "Ejemplo para media móvil 3 meses: el primer mes de test usa los 3 meses reales anteriores; "
+                "el segundo mes de test ya incorpora el primer mes real de test; y así sucesivamente."
             )
 
             best_row = results_df[results_df["Modelo"] == best_model].iloc[0]
@@ -1321,7 +1550,7 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
 
             st.dataframe(backtest_view, use_container_width=True)
 
-            st.subheader("8. Grafico comparativo")
+            st.subheader("9. Gráfico comparativo")
 
             fig = build_chart(df, auto_forecast, manual_forecast)
 
@@ -1329,16 +1558,16 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 chart_df = pd.concat([
-                    df.set_index("Fecha")["Ventas"].rename("Historico"),
-                    auto_forecast.set_index("Fecha")["Forecast"].rename("Forecast automatico"),
+                    df.set_index("Fecha")["Ventas"].rename("Histórico"),
+                    auto_forecast.set_index("Fecha")["Forecast"].rename("Forecast automático"),
                     manual_forecast.set_index("Fecha")["Forecast"].rename("Forecast manual")
                 ], axis=1)
 
                 st.line_chart(chart_df)
 
-            st.subheader("9. Descargas")
+            st.subheader("10. Descargas")
 
-            d1, d2, d3 = st.columns(3)
+            d1, d2, d3, d4 = st.columns(4)
 
             with d1:
                 csv_horizontal = horizontal_df.to_csv(index=False, sep=";").encode("utf-8-sig")
@@ -1366,9 +1595,35 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
                 csv_backtest = backtest_view.to_csv(index=False, sep=";").encode("utf-8-sig")
 
                 st.download_button(
-                    "⬇️ Backtesting ultimos 4 meses CSV",
+                    "⬇️ Backtesting CSV",
                     data=csv_backtest,
                     file_name="backtesting_walk_forward_ultimos_4_meses.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+            with d4:
+                summary_export = pd.DataFrame([{
+                    "Modelo ganador": best_model,
+                    "Métrica selección": best_metric_name,
+                    "Error selección_%": best_metric,
+                    "Índice Confiabilidad Forecast": reliability["FRI"],
+                    "Nivel Confiabilidad": reliability["Banda"],
+                    "Tipo demanda": demand_summary["Tipo demanda"],
+                    "Explicación demanda": demand_summary["Explicación"],
+                    "Recomendación": demand_summary["Recomendación"],
+                    "CV": demand_summary["CV"],
+                    "Meses con venta cero_%": demand_summary["Meses con venta cero_%"],
+                    "Tendencia mensual_%": demand_summary["Tendencia mensual_%"],
+                    "Estacionalidad detectada": demand_summary["Estacionalidad detectada"]
+                }])
+
+                csv_summary = summary_export.to_csv(index=False, sep=";").encode("utf-8-sig")
+
+                st.download_button(
+                    "⬇️ Resumen diagnóstico CSV",
+                    data=csv_summary,
+                    file_name="resumen_diagnostico_forecast.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
@@ -1376,9 +1631,9 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
             st.markdown("---")
 
             st.warning(
-                "Revision recomendada de Demand Planning: valida manualmente el forecast si existen "
+                "Revisión recomendada de Demand Planning: valida manualmente el forecast si existen "
                 "lanzamientos, promociones, roturas de stock, ventas extraordinarias, phase-out, "
-                "cambios de cliente, cambios de distribucion o restricciones de suministro."
+                "cambios de cliente, cambios de distribución o restricciones de suministro."
             )
 
         except Exception as e:
@@ -1393,6 +1648,6 @@ if st.session_state["result_ready"] and st.session_state["df"] is not None:
 st.markdown("---")
 
 st.caption(
-    "MVP de forecasting automatico. Compara modelos mediante backtesting walk-forward, "
-    "selecciona el mejor y permite calcular una alternativa manual seleccionada por el usuario."
+    "MVP de forecasting automático. Compara modelos mediante backtesting walk-forward, "
+    "selecciona el mejor, clasifica la demanda y calcula un índice de confiabilidad de forecast."
 )
