@@ -37,9 +37,10 @@ try:
 except Exception:
     RFOREST_OK = False
 
+FORECAST_HORIZON = 19
 st.set_page_config(page_title="Forecast automático V2", page_icon="📈", layout="wide")
 st.title("📈 Forecast automático de ventas V2")
-st.caption("Backtesting walk-forward, demanda intermitente, confiabilidad, selección automática y ensembles Top 4.")
+st.caption("Backtesting walk-forward, demanda intermitente, confiabilidad, previsión a 19 meses y ensembles Top 4.")
 
 # ============================== DATOS ==============================
 def clean_number(value):
@@ -80,8 +81,8 @@ def parse_pasted_data(raw_text, start_month):
     result = result.sort_values("Fecha").drop_duplicates("Fecha", keep="last").reset_index(drop=True)
     if result.empty: raise ValueError("No hay filas válidas.")
     if (result["Ventas"] < 0).any(): raise ValueError("Hay ventas negativas.")
-    all_dates = pd.date_range(result["Fecha"].min(), result["Fecha"].max(), freq="MS")
-    return pd.DataFrame({"Fecha": all_dates}).merge(result, on="Fecha", how="left").fillna({"Ventas": 0})
+    complete_dates = pd.date_range(result["Fecha"].min(), result["Fecha"].max(), freq="MS")
+    return pd.DataFrame({"Fecha": complete_dates}).merge(result, on="Fecha", how="left").fillna({"Ventas": 0})
 
 # ============================== MÉTRICAS ==============================
 def mape(actual, pred):
@@ -105,8 +106,7 @@ def round_zero(values):
 
 # ============================== DIAGNÓSTICO Y CONFIABILIDAD ==============================
 def demand_diagnosis(df):
-    y = df["Ventas"].astype(float)
-    mean = y.mean()
+    y = df["Ventas"].astype(float); mean = y.mean()
     cv = y.std(ddof=0) / mean if mean else np.nan
     zero_ratio = (y == 0).mean()
     slope = np.polyfit(np.arange(len(y)), y, 1)[0] / mean if len(y) > 1 and mean else 0
@@ -115,8 +115,7 @@ def demand_diagnosis(df):
         strength = df.assign(Mes=df["Fecha"].dt.month).groupby("Mes")["Ventas"].mean().std(ddof=0) / mean
         seasonal = strength >= 0.20
     first4, last4 = y.head(4).mean(), y.tail(4).mean()
-    last3 = y.tail(3).mean()
-    previous6 = y.iloc[-9:-3].mean() if len(y) >= 9 else np.nan
+    last3 = y.tail(3).mean(); previous6 = y.iloc[-9:-3].mean() if len(y) >= 9 else np.nan
     if mean == 0:
         kind, explanation, recommendation = "Sin demanda histórica", "La media histórica es cero.", "Utilizar información comercial o de lanzamiento."
     elif zero_ratio >= 0.40:
@@ -147,30 +146,28 @@ def confidence_level(score):
     return "Muy Baja", "🔴", "Forecast poco fiable. No utilizar sin validación manual y fuentes adicionales."
 
 def forecast_confidence(df, error_value):
-    y, n = df["Ventas"].astype(float), len(df)
-    mean = y.mean()
+    y, n = df["Ventas"].astype(float), len(df); mean = y.mean()
     cv = y.std(ddof=0) / mean if mean else np.nan
     error_score = max(0, 100 - 2 * error_value) if not pd.isna(error_value) else 0
     stability_score = 0 if pd.isna(cv) else 100 if cv <= 0.20 else 0 if cv >= 1 else 100 * (1 - (cv - 0.20) / 0.80)
     history_score = 100 if n >= 48 else 85 + (n - 36) * 1.25 if n >= 36 else 70 + (n - 24) * 1.25 if n >= 24 else 50 + (n - 16) * 2.5
     score = round(0.50 * error_score + 0.30 * stability_score + 0.20 * history_score, 1)
-    level, icon, use = confidence_level(score)
-    return {"Confiabilidad": score, "Nivel": level, "Indicador": icon, "Interpretación": use, "Score precisión": round(error_score, 1), "Score estabilidad": round(stability_score, 1), "Score histórico": round(history_score, 1)}
+    level, icon, interpretation = confidence_level(score)
+    return {"Confiabilidad": score, "Nivel": level, "Indicador": icon, "Interpretación": interpretation, "Score precisión": round(error_score, 1), "Score estabilidad": round(stability_score, 1), "Score histórico": round(history_score, 1)}
 
-# ============================== CROSTON, SBA Y TSB ==============================
+# ============================== CROSTON / SBA / TSB ==============================
 def croston_rate(y, alpha=0.1, variant="Croston", beta=0.05):
-    y = np.asarray(y, float)
-    nz = np.flatnonzero(y > 0)
-    if len(nz) == 0: return 0.0
+    y = np.asarray(y, float); nonzero = np.flatnonzero(y > 0)
+    if len(nonzero) == 0: return 0.0
     if variant == "TSB":
-        size, probability = y[nz[0]], 1.0
-        for value in y[nz[0] + 1:]:
+        size, probability = y[nonzero[0]], 1.0
+        for value in y[nonzero[0] + 1:]:
             occurrence = 1.0 if value > 0 else 0.0
             probability = beta * occurrence + (1 - beta) * probability
             if value > 0: size = alpha * value + (1 - alpha) * size
         return probability * size
-    size, interval, gap = y[nz[0]], 1.0, 0
-    for value in y[nz[0] + 1:]:
+    size, interval, gap = y[nonzero[0]], 1.0, 0
+    for value in y[nonzero[0] + 1:]:
         gap += 1
         if value > 0:
             size = alpha * value + (1 - alpha) * size
@@ -180,8 +177,7 @@ def croston_rate(y, alpha=0.1, variant="Croston", beta=0.05):
     return rate * (1 - alpha / 2) if variant == "SBA" else rate
 
 def intermittent_forecast(y, horizon, variant):
-    best = (float("inf"), 0.1, 0.05)
-    y = np.asarray(y, float)
+    y = np.asarray(y, float); best = (float("inf"), 0.1, 0.05)
     for alpha in [0.05, 0.10, 0.15, 0.20, 0.30]:
         for beta in ([0.02, 0.05, 0.10, 0.20] if variant == "TSB" else [0.05]):
             errors = [abs(y[i] - croston_rate(y[:i], alpha, variant, beta)) for i in range(max(6, len(y) - 4), len(y))]
@@ -192,13 +188,13 @@ def intermittent_forecast(y, horizon, variant):
 # ============================== MACHINE LEARNING ==============================
 BASE_FEATURES = ["lag1", "lag2", "lag3", "lag6", "mean3", "mean6", "std3", "month_sin", "month_cos", "trend"]
 def ml_training_table(y, dates):
-    d = pd.DataFrame({"Fecha": pd.to_datetime(dates).reset_index(drop=True), "y": pd.Series(np.asarray(y, float))})
-    for lag in [1, 2, 3, 6]: d[f"lag{lag}"] = d["y"].shift(lag)
+    data = pd.DataFrame({"Fecha": pd.to_datetime(dates).reset_index(drop=True), "y": pd.Series(np.asarray(y, float))})
+    for lag in [1, 2, 3, 6]: data[f"lag{lag}"] = data["y"].shift(lag)
     features = BASE_FEATURES.copy()
-    if len(d) >= 24: d["lag12"] = d["y"].shift(12); features.insert(4, "lag12")
-    d["mean3"] = d["y"].shift(1).rolling(3).mean(); d["mean6"] = d["y"].shift(1).rolling(6).mean(); d["std3"] = d["y"].shift(1).rolling(3).std(ddof=0)
-    d["month_sin"] = np.sin(2 * np.pi * d["Fecha"].dt.month / 12); d["month_cos"] = np.cos(2 * np.pi * d["Fecha"].dt.month / 12); d["trend"] = np.arange(len(d))
-    return d.dropna().reset_index(drop=True), features
+    if len(data) >= 24: data["lag12"] = data["y"].shift(12); features.insert(4, "lag12")
+    data["mean3"] = data["y"].shift(1).rolling(3).mean(); data["mean6"] = data["y"].shift(1).rolling(6).mean(); data["std3"] = data["y"].shift(1).rolling(3).std(ddof=0)
+    data["month_sin"] = np.sin(2 * np.pi * data["Fecha"].dt.month / 12); data["month_cos"] = np.cos(2 * np.pi * data["Fecha"].dt.month / 12); data["trend"] = np.arange(len(data))
+    return data.dropna().reset_index(drop=True), features
 
 def ml_forecast(y, dates, horizon, model_name):
     history, date_history = list(np.asarray(y, float)), list(pd.to_datetime(dates))
@@ -220,8 +216,8 @@ def ml_forecast(y, dates, horizon, model_name):
         lag = lambda k: history[-k] if len(history) >= k else history[0]
         row = {"lag1": lag(1), "lag2": lag(2), "lag3": lag(3), "lag6": lag(6), "mean3": np.mean(history[-3:]), "mean6": np.mean(history[-6:]), "std3": np.std(history[-3:]), "month_sin": np.sin(2*np.pi*next_date.month/12), "month_cos": np.cos(2*np.pi*next_date.month/12), "trend": len(history)}
         if "lag12" in features: row["lag12"] = lag(12)
-        pred = max(0, float(model.predict(pd.DataFrame([row])[features])[0]))
-        output.append(pred); history.append(pred)
+        prediction = max(0, float(model.predict(pd.DataFrame([row])[features])[0]))
+        output.append(prediction); history.append(prediction)
     return np.asarray(output)
 
 # ============================== MODELOS ==============================
@@ -268,17 +264,14 @@ def run_model(name, y, dates, horizon):
     if name in ["LightGBM", "XGBoost", "Random Forest"]: return ml_forecast(y, dates, horizon, name)
     raise ValueError("Modelo no reconocido.")
 
-# ============================== BACKTESTING Y BLENDS ==============================
+# ============================== BACKTESTING Y ENSEMBLES ==============================
 def run_backtesting(df):
-    cut = len(df) - 4
-    actual = df.iloc[cut:]["Ventas"].values
-    rows = []
+    cut = len(df) - 4; actual = df.iloc[cut:]["Ventas"].values; rows = []
     for name in available_models(len(df)):
         try:
             pred = np.array([round_zero(run_model(name, df.iloc[:i]["Ventas"], df.iloc[:i]["Fecha"], 1))[0] for i in range(cut, len(df))], float)
             ma, sm, wm = mape(actual, pred), smape(actual, pred), wmape(actual, pred)
-            metric = "sMAPE" if np.any(actual == 0) else "MAPE"
-            selected_error = sm if metric == "sMAPE" else ma
+            metric = "sMAPE" if np.any(actual == 0) else "MAPE"; selected_error = sm if metric == "sMAPE" else ma
             rows.append({"Modelo": name, "MAPE_%": ma, "sMAPE_%": sm, "WMAPE_%": wm, "Métrica": metric, "Error selección_%": selected_error, **{f"BT{i+1}": pred[i] for i in range(4)}, "Estado": "OK", "Detalle": ""})
         except Exception as exc:
             rows.append({"Modelo": name, "MAPE_%": np.nan, "sMAPE_%": np.nan, "WMAPE_%": np.nan, "Métrica": "", "Error selección_%": np.nan, **{f"BT{i+1}": np.nan for i in range(4)}, "Estado": "Error", "Detalle": str(exc)})
@@ -288,8 +281,8 @@ def run_backtesting(df):
     return results, valid, df.iloc[cut:].copy()
 
 def future_forecast(df, name):
-    values = round_zero(run_model(name, df["Ventas"], df["Fecha"], 18))
-    return pd.DataFrame({"Fecha": pd.date_range(df["Fecha"].max() + pd.DateOffset(months=1), periods=18, freq="MS"), "Forecast": values})
+    values = round_zero(run_model(name, df["Ventas"], df["Fecha"], FORECAST_HORIZON))
+    return pd.DataFrame({"Fecha": pd.date_range(df["Fecha"].max() + pd.DateOffset(months=1), periods=FORECAST_HORIZON, freq="MS"), "Forecast": values})
 
 def ensemble_forecasts(df, valid):
     items = []
@@ -302,15 +295,15 @@ def ensemble_forecasts(df, valid):
     errors = np.array([max(item[2], 0.01) for item in items])
     dynamic_weights = (1 / errors) / (1 / errors).sum()
     matrix = np.vstack([item[1]["Forecast"].values for item in items])
-    base = items[0][1][["Fecha"]].copy()
-    fixed, dynamic = base.copy(), base.copy()
+    base = items[0][1][["Fecha"]].copy(); fixed, dynamic = base.copy(), base.copy()
     fixed["Forecast"] = round_zero(fixed_weights @ matrix)
     dynamic["Forecast"] = round_zero(dynamic_weights @ matrix)
     detail = pd.DataFrame({"Posición": range(1,5), "Modelo": [x[0] for x in items], "Error_%": errors, "Peso fijo": fixed_weights, "Peso dinámico": dynamic_weights})
     return fixed, dynamic, detail
 
 def horizontal(forecast, forecast_type, model):
-    return {"Tipo": forecast_type, "Modelo": model, **{f"M+{i+1}": int(v) for i, v in enumerate(forecast["Forecast"])}}
+    values = forecast["Forecast"].astype(int).tolist()
+    return {"Tipo": forecast_type, "Modelo": model, "Total unidades 19 meses": int(sum(values)), **{f"M+{i+1}": value for i, value in enumerate(values)}}
 
 # ============================== INTERFAZ ==============================
 EXAMPLE = """Fecha\tVentas
@@ -339,7 +332,7 @@ def clear_history():
 with st.sidebar:
     st.header("Configuración")
     start_month = st.text_input("Mes inicial si pegas solo ventas", "2025-01")
-    st.markdown("**V2:** Croston, SBA, TSB, ensemble fijo y dinámico. ML desde 18 meses y modelos estacionales desde 24.")
+    st.markdown("**Horizonte fijo:** 19 meses. V2 incluye Croston, SBA, TSB, ensemble fijo y dinámico. ML desde 18 meses y estacionales desde 24.")
     for name, ok in [("Prophet", PROPHET_OK), ("LightGBM", LGBM_OK), ("XGBoost", XGBOOST_OK), ("Random Forest", RFOREST_OK)]:
         st.write(f"{name}: {'✅' if ok else '❌'}")
 
@@ -355,15 +348,12 @@ if calculate:
         results, valid, test = run_backtesting(df)
         st.session_state.update({"ready": True, "raw": raw_data, "df": df, "results": results, "valid": valid, "test": test})
     except Exception as exc:
-        st.session_state.ready = False
-        st.error(str(exc))
+        st.session_state.ready = False; st.error(str(exc))
 
 if st.session_state.ready:
     df, results, valid, test = st.session_state.df, st.session_state.results, st.session_state.valid, st.session_state.test
-    best_model = valid.iloc[0]["Modelo"]
-    best_error = float(valid.iloc[0]["Error selección_%"])
-    diagnosis = demand_diagnosis(df)
-    confiability = forecast_confidence(df, best_error)
+    best_model = valid.iloc[0]["Modelo"]; best_error = float(valid.iloc[0]["Error selección_%"])
+    diagnosis = demand_diagnosis(df); confiability = forecast_confidence(df, best_error)
 
     st.subheader("1. Diagnóstico")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -372,63 +362,56 @@ if st.session_state.ready:
     c3.metric("Mejor modelo", best_model)
     c4.metric("Confiabilidad", f"{confiability['Confiabilidad']}/100")
     c5.metric("Nivel", f"{confiability['Indicador']} {confiability['Nivel']}")
-    st.info(diagnosis["Explicación"])
-    st.warning(confiability["Interpretación"])
-
+    st.info(diagnosis["Explicación"]); st.warning(confiability["Interpretación"])
     with st.expander("¿Cómo se calcula e interpreta la confiabilidad?"):
-        st.markdown("""
-El índice combina:
-- **50% precisión histórica**, basada en el error del backtesting.
-- **30% estabilidad de la demanda**, basada en el coeficiente de variación.
-- **20% cantidad de histórico disponible**.
-
-Niveles:
-- **90 a 100: Muy Alta**
-- **75 a 89,9: Alta**
-- **60 a 74,9: Media**
-- **40 a 59,9: Baja**
-- **0 a 39,9: Muy Baja**
-        """)
+        st.markdown(
+            "**50% precisión histórica + 30% estabilidad + 20% cantidad de histórico.**\n\n"
+            "- 90-100: Muy Alta\n"
+            "- 75-89,9: Alta\n"
+            "- 60-74,9: Media\n"
+            "- 40-59,9: Baja\n"
+            "- 0-39,9: Muy Baja"
+        )
         st.dataframe(pd.DataFrame([confiability]), use_container_width=True)
         st.dataframe(pd.DataFrame([diagnosis]), use_container_width=True)
 
     if len(df) < 18: st.info("LightGBM, XGBoost y Random Forest se activan desde 18 meses.")
     if len(df) < 24: st.info("Naive estacional y Holt-Winters se activan desde 24 meses.")
-
     manual_model = st.selectbox("Modelo alternativo", results[results["Estado"] == "OK"]["Modelo"].tolist(), index=0)
-    try:
-        automatic = future_forecast(df, best_model)
-        manual = future_forecast(df, manual_model)
-        fixed, dynamic, weights = ensemble_forecasts(df, valid)
-        output = pd.DataFrame([horizontal(automatic, "Automático", best_model), horizontal(manual, "Manual", manual_model), horizontal(fixed, "Ensemble fijo Top 4", "0,4/0,3/0,2/0,1"), horizontal(dynamic, "Ensemble dinámico Top 4", "Inverso al error")])
-        st.subheader("2. Forecast horizontal a 18 meses")
-        st.dataframe(output, use_container_width=True)
-        st.subheader("3. Pesos del ensemble")
-        st.dataframe(weights, use_container_width=True)
-        st.caption("Todos los forecasts se redondean a 0 decimales después de combinar los modelos.")
 
+    try:
+        automatic = future_forecast(df, best_model); manual = future_forecast(df, manual_model)
+        fixed, dynamic, weights = ensemble_forecasts(df, valid)
+        output = pd.DataFrame([
+            horizontal(automatic, "Automático", best_model),
+            horizontal(manual, "Manual", manual_model),
+            horizontal(fixed, "Ensemble fijo Top 4", "0,4/0,3/0,2/0,1"),
+            horizontal(dynamic, "Ensemble dinámico Top 4", "Inverso al error")
+        ])
+        st.subheader("2. Forecast horizontal a 19 meses")
+        st.dataframe(output, use_container_width=True)
+        st.caption("La columna Total unidades 19 meses suma M+1 a M+19 para cada alternativa. Todos los valores están redondeados a 0 decimales.")
+
+        st.subheader("3. Pesos del ensemble"); st.dataframe(weights, use_container_width=True)
         st.subheader("4. Comparativa walk-forward")
         display = results.copy()
         for col in ["MAPE_%", "sMAPE_%", "WMAPE_%", "Error selección_%"]: display[col] = display[col].round(2)
         st.dataframe(display, use_container_width=True)
 
         winner = results[results["Modelo"] == best_model].iloc[0]
-        backtest = test.copy()
-        backtest["Forecast"] = [winner[f"BT{i}"] for i in range(1, 5)]
+        backtest = test.copy(); backtest["Forecast"] = [winner[f"BT{i}"] for i in range(1, 5)]
         backtest["Error %"] = np.where(backtest["Ventas"] != 0, abs(backtest["Ventas"] - backtest["Forecast"]) / backtest["Ventas"] * 100, np.nan)
-        st.subheader("5. Backtesting del ganador")
-        st.dataframe(backtest, use_container_width=True)
+        st.subheader("5. Backtesting del ganador"); st.dataframe(backtest, use_container_width=True)
 
         if PLOTLY_OK:
-            fig = go.Figure()
-            fig.add_scatter(x=df["Fecha"], y=df["Ventas"], name="Histórico", mode="lines+markers")
+            fig = go.Figure(); fig.add_scatter(x=df["Fecha"], y=df["Ventas"], name="Histórico", mode="lines+markers")
             for forecast, name, dash in [(automatic, "Automático", None), (manual, "Manual", "dash"), (fixed, "Top 4 fijo", "dot"), (dynamic, "Top 4 dinámico", "dashdot")]:
                 fig.add_scatter(x=forecast["Fecha"], y=forecast["Forecast"], name=name, mode="lines+markers", line=dict(dash=dash) if dash else None)
-            fig.update_layout(template="plotly_white", height=520)
+            fig.update_layout(template="plotly_white", height=520, title="Histórico y previsión a 19 meses")
             st.plotly_chart(fig, use_container_width=True)
 
         d1, d2, d3 = st.columns(3)
-        d1.download_button("Forecast CSV", output.to_csv(index=False, sep=";").encode("utf-8-sig"), "forecast_v2.csv", "text/csv", use_container_width=True)
+        d1.download_button("Forecast CSV", output.to_csv(index=False, sep=";").encode("utf-8-sig"), "forecast_19_meses.csv", "text/csv", use_container_width=True)
         d2.download_button("Modelos CSV", results.to_csv(index=False, sep=";").encode("utf-8-sig"), "modelos_v2.csv", "text/csv", use_container_width=True)
         d3.download_button("Pesos CSV", weights.to_csv(index=False, sep=";").encode("utf-8-sig"), "pesos_v2.csv", "text/csv", use_container_width=True)
     except Exception as exc:
