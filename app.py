@@ -1,17 +1,15 @@
-"""Laboratorio Forecast V3 — comparación ligera de 16 algoritmos.
+"""Laboratorio Forecast V3: comparación de algoritmos por referencia.
 
-Alineado en lo aplicable con ForecastDefinitivo.py (producción):
-- historia efectiva 12..48 meses; backtesting rolling de hasta 4 ventanas x 4 meses;
-- métricas sMAPE, WMAPE y MAPE sobre predicciones NO redondeadas;
-- features ML lags (1,2,3,6,12), rolling (3,6,12), expmean y calendario;
-- log1p, smearing, ponderación de recencia y floor ML (0.25*mediana últimos 6m);
-- Prophet: modo de crecimiento, cap, estacionalidad anual/semestral.
+Historia efectiva de hasta 48 meses; entrenamiento mínimo general de 12 meses;
+backtesting rolling de hasta cuatro ventanas de cuatro meses; forecast a 18 meses.
+Las métricas se calculan sin redondear las predicciones. El ranking del ensemble
+fijo y dinámico y de la comparativa walk-forward procede de la misma tabla.
 
-IMPORTANTE: cada algoritmo se ajusta *por referencia*, no hay aprendizaje global
-entre referencias como podría hacerse con datos de múltiples series.
-El error del mismo backtest usado para seleccionar hiperparámetros es exploratorio:
-no equivale a una evaluación fuera de muestra independiente de esa selección.
+No hay aprendizaje global entre referencias. El backtesting se reutiliza para
+seleccionar hiperparámetros: sus errores son exploratorios, no una evaluación
+independiente del proceso de selección.
 """
+
 from __future__ import annotations
 
 import io
@@ -34,39 +32,46 @@ try:
     PLOTLY_OK = True
 except ImportError:
     PLOTLY_OK = False
+
 try:
     from statsmodels.tsa.holtwinters import SimpleExpSmoothing, Holt, ExponentialSmoothing
     from statsmodels.tsa.statespace.sarimax import SARIMAX
     STATSMODELS_OK = True
 except ImportError:
     STATSMODELS_OK = False
+
 try:
     from prophet import Prophet
     PROPHET_OK = True
 except ImportError:
     PROPHET_OK = False
+
 try:
     from lightgbm import LGBMRegressor
     LGBM_OK = True
 except ImportError:
     LGBM_OK = False
+
 try:
     from xgboost import XGBRegressor
     XGBOOST_OK = True
 except ImportError:
     XGBOOST_OK = False
+
 try:
     from sklearn.ensemble import RandomForestRegressor
     RFOREST_OK = True
 except ImportError:
     RFOREST_OK = False
 
+
 # ========================== POLÍTICA COMÚN ==========================
+
 MIN_HISTORY_MONTHS = 12
 MAX_HISTORY_MONTHS = 48
 BACKTEST_HORIZON = 4
 MAX_BACKTEST_WINDOWS = 4
-FORECAST_HORIZON = 18  # Conservamos los 18 meses de la interfaz original.
+FORECAST_HORIZON = 18
 ML_LAGS = (1, 2, 3, 6, 12)
 ML_WINDOWS = (3, 6, 12)
 ML_FLOOR_RATIO = 0.25
@@ -82,11 +87,16 @@ ALL_MODELS = [
 MODEL_MIN_TRAIN = {name: MIN_HISTORY_MONTHS for name in ALL_MODELS}
 MODEL_MIN_TRAIN.update({"Naive estacional 12": 24, "Holt-Winters estacional": 24})
 
-st.set_page_config(page_title="Forecast automático V3", page_icon="📈", layout="wide")
-st.title("📈 Forecast automático de ventas V3")
-st.caption("Laboratorio por referencia · barrido ligero de hiperparámetros · backtesting rolling de 4 meses · ensembles Top 4")
+TOP_N = 4
+FIXED_WEIGHTS = np.array([.4, .3, .2, .1])
+MIN_WEIGHT_ERROR = .01  # Puntos porcentuales. Solo se aplica al calcular pesos.
+RANKING_COLUMN = "Error ranking_%"
+SELECTION_COLUMN = "Error selección_%"
+RANKING_KEYS = [RANKING_COLUMN, SELECTION_COLUMN, "WMAPE_%"]
+
 
 # ========================== DATOS ==========================
+
 def clean_number(value: Any) -> float:
     if pd.isna(value):
         return np.nan
@@ -117,18 +127,18 @@ def normalize_history(frame: pd.DataFrame) -> pd.DataFrame:
     df["Fecha"] = df["Fecha"].dt.to_period("M").dt.to_timestamp()
     df = df.sort_values("Fecha").drop_duplicates("Fecha", keep="last")
     dates = pd.date_range(df["Fecha"].min(), df["Fecha"].max(), freq="MS")
-    # Compatibilidad con el laboratorio original: huecos intermedios = 0.
+    # Política original: los meses intermedios sin registro se rellenan con cero.
     df = pd.DataFrame({"Fecha": dates}).merge(df, on="Fecha", how="left")
     missing_months = int(df["Ventas"].isna().sum())
     df["Ventas"] = df["Ventas"].fillna(0.0)
     nonzero = np.flatnonzero(df["Ventas"].to_numpy(float) != 0)
-    if len(nonzero) == 0:
+    if not len(nonzero):
         raise ValueError("La referencia no presenta demanda histórica distinta de cero.")
     df = df.iloc[int(nonzero[0]):].tail(MAX_HISTORY_MONTHS).reset_index(drop=True)
     if len(df) < MIN_HISTORY_MONTHS + BACKTEST_HORIZON:
         raise ValueError(
             f"Se requieren al menos {MIN_HISTORY_MONTHS + BACKTEST_HORIZON} meses "
-            "de historia efectiva para comparar modelos con un backtest de 4 meses."
+            f"de historia efectiva para comparar modelos con un backtest de {BACKTEST_HORIZON} meses."
         )
     df.attrs["meses_rellenados_cero"] = missing_months
     return df
@@ -188,7 +198,9 @@ def parse_reference_csv(uploaded) -> tuple[pd.DataFrame, str]:
     df[reference_col] = df[reference_col].fillna("Sin referencia").astype(str)
     return df.rename(columns={date_col: "Fecha", value_col: "Ventas"}), reference_col
 
+
 # ========================== MÉTRICAS ==========================
+
 def mape(actual: Any, pred: Any) -> float:
     a, p = np.asarray(actual, float), np.asarray(pred, float)
     mask = a != 0
@@ -196,7 +208,7 @@ def mape(actual: Any, pred: Any) -> float:
 
 
 def smape(actual: Any, pred: Any) -> float:
-    # Misma convención que ForecastDefinitivo: par (0,0) aporta error 0.
+    # Un par (0, 0) aporta error cero.
     a, p = np.asarray(actual, float), np.asarray(pred, float)
     den = np.abs(a) + np.abs(p)
     den = np.where(den == 0.0, 1.0, den)
@@ -217,7 +229,9 @@ def round_zero(values: Any) -> np.ndarray:
         raise ValueError("Predicciones finales con NaN/inf.")
     return np.rint(np.clip(a, 0.0, None)).astype(int)
 
+
 # ========================== DIAGNÓSTICO Y CONFIABILIDAD ==========================
+
 def demand_diagnosis(df: pd.DataFrame) -> dict[str, Any]:
     y = df["Ventas"].astype(float)
     mean = y.mean()
@@ -227,15 +241,15 @@ def demand_diagnosis(df: pd.DataFrame) -> dict[str, Any]:
     seasonal, strength = False, np.nan
     if len(y) >= 24 and mean:
         strength = df.assign(Mes=df["Fecha"].dt.month).groupby("Mes")["Ventas"].mean().std(ddof=0) / mean
-        seasonal = strength >= 0.20
+        seasonal = strength >= .20
     first4, last4 = y.head(4).mean(), y.tail(4).mean()
     last3 = y.tail(3).mean()
     previous6 = y.iloc[-9:-3].mean() if len(y) >= 9 else np.nan
-    if zero_ratio >= 0.40:
+    if zero_ratio >= .40:
         kind, explanation = "Intermitente", "Proporción elevada de meses con venta cero; comparar Croston, SBA y TSB."
-    elif len(y) >= 8 and first4 > 0 and last4 >= 1.8 * first4 and slope > 0.03:
+    elif len(y) >= 8 and first4 > 0 and last4 >= 1.8 * first4 and slope > .03:
         kind, explanation = "Posible lanzamiento", "La demanda reciente crece respecto del inicio; revisar distribución y ramp-up."
-    elif len(y) >= 9 and previous6 > 0 and last3 <= 0.5 * previous6 and slope < -0.03:
+    elif len(y) >= 9 and previous6 > 0 and last3 <= .5 * previous6 and slope < -.03:
         kind, explanation = "Posible phase-out", "Caída reciente; validar descatalogación o sustitución."
     elif seasonal:
         kind, explanation = "Estacional", "Hay diferencias por mes calendario; revisar modelos estacionales."
@@ -255,10 +269,14 @@ def demand_diagnosis(df: pd.DataFrame) -> dict[str, Any]:
 
 
 def confidence_level(score: float):
-    if score >= 90: return "Muy Alta", "🟢", "Score heurístico alto; validar con Demand Planning."
-    if score >= 75: return "Alta", "🟢", "Precisión y estabilidad favorables en el backtesting."
-    if score >= 60: return "Media", "🟡", "Validar con información comercial."
-    if score >= 40: return "Baja", "🟠", "Incertidumbre significativa; requiere revisión."
+    if score >= 90:
+        return "Muy Alta", "🟢", "Score heurístico alto; validar con Demand Planning."
+    if score >= 75:
+        return "Alta", "🟢", "Precisión y estabilidad favorables en el backtesting."
+    if score >= 60:
+        return "Media", "🟡", "Validar con información comercial."
+    if score >= 40:
+        return "Baja", "🟠", "Incertidumbre significativa; requiere revisión."
     return "Muy Baja", "🔴", "No utilizar automáticamente sin validación comercial."
 
 
@@ -267,18 +285,20 @@ def forecast_confidence(df: pd.DataFrame, error_value: float) -> dict[str, Any]:
     cv = y.std(ddof=0) / y.mean() if y.mean() else np.nan
     error_score = max(0., 100. - 2. * error_value) if np.isfinite(error_value) else 0.
     stability_score = 0 if pd.isna(cv) else 100 if cv <= .20 else 0 if cv >= 1 else 100 * (1 - (cv - .20) / .80)
-    history_score = 100 if n >= 48 else 85 + (n - 36) * 1.25 if n >= 36 else 70 + (n - 24) * 1.25 if n >= 24 else 50 + (n - 16) * 2.5
+    history_score = (100 if n >= 48 else 85 + (n - 36) * 1.25 if n >= 36 else
+                     70 + (n - 24) * 1.25 if n >= 24 else 50 + (n - 16) * 2.5)
     score = round(.5 * error_score + .3 * stability_score + .2 * history_score, 1)
     level, emoji, interpretation = confidence_level(score)
     return {"Confiabilidad": score, "Nivel": level, "Indicador": emoji, "Interpretación": interpretation,
             "Score precisión": round(error_score, 1), "Score estabilidad": round(stability_score, 1),
             "Score histórico": round(history_score, 1)}
 
+
 # ========================== CONFIGURACIONES LIGERAS ==========================
+
 def candidate_configs(name: str) -> list[dict[str, Any]]:
-    """3–4 combinaciones representativas por algoritmo; NO producto cartesiano."""
-    if name in ("Naive",):
-        return [{}]  # No tiene hiperparámetros.
+    if name == "Naive":
+        return [{}]
     if name.startswith("Media móvil"):
         return [{"peso": x} for x in ("uniforme", "lineal", "exponencial")]
     if name == "Naive estacional 12":
@@ -328,7 +348,9 @@ def candidate_configs(name: str) -> list[dict[str, Any]]:
 def config_string(config: dict) -> str:
     return json.dumps(config, ensure_ascii=False, sort_keys=True)
 
+
 # ========================== DEMANDA INTERMITENTE ==========================
+
 def croston_rate(y: np.ndarray, alpha: float, variant: str, beta: float = .05) -> float:
     y = np.asarray(y, float)
     nz = np.flatnonzero(y > 0)
@@ -336,13 +358,14 @@ def croston_rate(y: np.ndarray, alpha: float, variant: str, beta: float = .05) -
         return 0.
     if variant == "TSB":
         size, probability = float(y[nz[0]]), 1.
-        for v in y[nz[0]+1:]:
+        for v in y[nz[0] + 1:]:
             present = float(v > 0)
             probability = beta * present + (1 - beta) * probability
-            if v > 0: size = alpha * v + (1 - alpha) * size
+            if v > 0:
+                size = alpha * v + (1 - alpha) * size
         return max(0., float(probability * size))
     size, interval, gap = float(y[nz[0]]), 1., 0
-    for v in y[nz[0]+1:]:
+    for v in y[nz[0] + 1:]:
         gap += 1
         if v > 0:
             size = alpha * v + (1 - alpha) * size
@@ -351,7 +374,9 @@ def croston_rate(y: np.ndarray, alpha: float, variant: str, beta: float = .05) -
     rate = size / max(interval, 1e-9)
     return max(0., float(rate * (1 - alpha / 2) if variant == "SBA" else rate))
 
-# ========================== ML - FEATURES DE PRODUCCIÓN ==========================
+
+# ========================== ML ==========================
+
 def ml_features(history: np.ndarray, dates: pd.Series) -> tuple[pd.DataFrame, list[str]]:
     y = np.asarray(history, float)
     ds = pd.to_datetime(pd.Series(dates)).reset_index(drop=True)
@@ -369,11 +394,8 @@ def ml_features(history: np.ndarray, dates: pd.Series) -> tuple[pd.DataFrame, li
     wanted = ["month", "quarter", "year", "mon_sin", "mon_cos", "expmean"]
     wanted += [f"lag_{k}" for k in ML_LAGS]
     wanted += [f"rollmean_{w}" for w in ML_WINDOWS]
-    # Replica la selección por variación de la implementación de producción.
     usable = [c for c in wanted if f[c].notna().sum() >= 3 and f[c].nunique(dropna=True) >= 2]
-    if not usable:
-        usable = ["month", "mon_sin", "mon_cos"]
-    return f, usable
+    return f, usable or ["month", "mon_sin", "mon_cos"]
 
 
 def ml_future_features(history: list[float], next_date: pd.Timestamp, features: list[str]) -> pd.DataFrame:
@@ -389,13 +411,16 @@ def ml_future_features(history: list[float], next_date: pd.Timestamp, features: 
 
 
 def ml_forecast(name: str, y: np.ndarray, dates: pd.Series, horizon: int, config: dict) -> np.ndarray:
-    if name == "LightGBM" and not LGBM_OK: raise ImportError("LightGBM no instalado")
-    if name == "XGBoost" and not XGBOOST_OK: raise ImportError("XGBoost no instalado")
-    if name == "Random Forest" and not RFOREST_OK: raise ImportError("scikit-learn no instalado")
+    if name == "LightGBM" and not LGBM_OK:
+        raise ImportError("LightGBM no instalado")
+    if name == "XGBoost" and not XGBOOST_OK:
+        raise ImportError("XGBoost no instalado")
+    if name == "Random Forest" and not RFOREST_OK:
+        raise ImportError("scikit-learn no instalado")
     train, features = ml_features(y, dates)
     X = train[features].astype("float32")
     if name == "Random Forest":
-        X = X.fillna(-1.0)  # Evita depender de la versión de sklearn para NaN.
+        X = X.fillna(-1.0)
     target = np.log1p(np.clip(np.asarray(y, float), 0., None))
     weights = np.linspace(1., 2., len(y))
     if name == "LightGBM":
@@ -410,22 +435,26 @@ def ml_forecast(name: str, y: np.ndarray, dates: pd.Series, horizon: int, config
         model = RandomForestRegressor(**config, n_jobs=1, random_state=RANDOM_STATE)
     model.fit(X, target, sample_weight=weights)
     fitted = np.asarray(model.predict(X), float)
-    smear = float(np.mean(np.exp(target - fitted)))  # Corrección Duan como en producción.
-    if not np.isfinite(smear) or smear <= 0: smear = 1.
+    smear = float(np.mean(np.exp(target - fitted)))
+    if not np.isfinite(smear) or smear <= 0:
+        smear = 1.
     values = list(np.asarray(y, float))
     last_date = pd.to_datetime(pd.Series(dates).iloc[-1])
     out = []
     for step in range(1, horizon + 1):
         xf = ml_future_features(values, last_date + pd.DateOffset(months=step), features)
-        if name == "Random Forest": xf = xf.fillna(-1.0)
+        if name == "Random Forest":
+            xf = xf.fillna(-1.0)
         yh = max(0., float(np.expm1(model.predict(xf)[0]) * smear))
         floor = ML_FLOOR_RATIO * float(np.median(values[-ML_FLOOR_MONTHS:]))
         yh = max(yh, floor)
         out.append(yh)
-        values.append(yh)  # Predicción recursiva; sin introducir datos reales futuros.
+        values.append(yh)  # Predicción recursiva, sin usar observaciones futuras.
     return np.asarray(out, float)
 
-# ========================== PROPHET - PRODUCCIÓN ==========================
+
+# ========================== PROPHET ==========================
+
 def prophet_growth(y: np.ndarray) -> str:
     if len(y) < 12:
         return "linear"
@@ -462,7 +491,9 @@ def prophet_forecast(y: np.ndarray, dates: pd.Series, horizon: int, config: dict
         future["floor"] = 0.
     return model.predict(future)["yhat"].to_numpy(float)
 
-# ========================== EJECUCIÓN ALGORITMOS ==========================
+
+# ========================== EJECUCIÓN DE ALGORITMOS ==========================
+
 def run_model(name: str, y: Any, dates: Any, horizon: int, config: dict) -> np.ndarray:
     y = np.asarray(y, float)
     if len(y) < MODEL_MIN_TRAIN[name]:
@@ -487,25 +518,29 @@ def run_model(name: str, y: Any, dates: Any, horizon: int, config: dict) -> np.n
     elif name in ("Croston", "SBA", "TSB"):
         pred = np.repeat(croston_rate(y, config["alpha"], name, config.get("beta", .05)), horizon)
     elif name == "Suavizado exponencial":
-        if not STATSMODELS_OK: raise ImportError("statsmodels no instalado")
+        if not STATSMODELS_OK:
+            raise ImportError("statsmodels no instalado")
         pred = np.asarray(SimpleExpSmoothing(y, initialization_method="estimated")
                           .fit(smoothing_level=config["alpha"], optimized=False).forecast(horizon))
     elif name in ("Holt", "Holt amortiguado"):
-        if not STATSMODELS_OK: raise ImportError("statsmodels no instalado")
+        if not STATSMODELS_OK:
+            raise ImportError("statsmodels no instalado")
         damped = name == "Holt amortiguado"
         fitted = Holt(y, damped_trend=damped, initialization_method="estimated").fit(
             smoothing_level=config["alpha"], smoothing_trend=config["beta"],
             damping_trend=config.get("phi") if damped else None, optimized=False)
         pred = np.asarray(fitted.forecast(horizon))
     elif name == "Holt-Winters estacional":
-        if not STATSMODELS_OK: raise ImportError("statsmodels no instalado")
+        if not STATSMODELS_OK:
+            raise ImportError("statsmodels no instalado")
         if config["seasonal"] == "mul" and (y <= 0).any():
             raise ValueError("Estacionalidad multiplicativa incompatible con ventas 0")
         fit = ExponentialSmoothing(y, trend=config["trend"], seasonal=config["seasonal"],
                                    seasonal_periods=12, initialization_method="estimated").fit(optimized=True)
         pred = np.asarray(fit.forecast(horizon))
     elif name == "ARIMA simple":
-        if not STATSMODELS_OK: raise ImportError("statsmodels no instalado")
+        if not STATSMODELS_OK:
+            raise ImportError("statsmodels no instalado")
         fit = SARIMAX(y, order=tuple(config["order"]), enforce_stationarity=False,
                       enforce_invertibility=False).fit(disp=False, maxiter=100)
         pred = np.asarray(fit.forecast(horizon))
@@ -522,14 +557,19 @@ def run_model(name: str, y: Any, dates: Any, horizon: int, config: dict) -> np.n
 
 
 def available_models(n_months: int) -> list[str]:
-    names = [n for n in ALL_MODELS if n not in ("LightGBM", "XGBoost", "Random Forest", "Naive estacional 12", "Holt-Winters estacional")]
-    if n_months >= 18: names.extend(("LightGBM", "XGBoost", "Random Forest"))
-    if n_months >= 24: names.extend(("Naive estacional 12", "Holt-Winters estacional"))
+    names = [n for n in ALL_MODELS if n not in (
+        "LightGBM", "XGBoost", "Random Forest", "Naive estacional 12", "Holt-Winters estacional"
+    )]
+    if n_months >= 18:
+        names.extend(("LightGBM", "XGBoost", "Random Forest"))
+    if n_months >= 24:
+        names.extend(("Naive estacional 12", "Holt-Winters estacional"))
     return names
 
-# ========================== BACKTEST 4 MESES ==========================
+
+# ========================== BACKTEST Y RANKING COMÚN ==========================
+
 def get_backtest_windows(n_history: int, max_windows: int = MAX_BACKTEST_WINDOWS) -> list[dict[str, int]]:
-    """Exacta política rolling de producción: 12m mínimo, 4m horizonte, cortes mensuales."""
     possible = max(0, n_history - (MIN_HISTORY_MONTHS + BACKTEST_HORIZON) + 1)
     n_windows = min(max_windows, possible)
     windows = []
@@ -550,7 +590,18 @@ class LabResult:
     window_count: int
 
 
-def run_backtesting(df: pd.DataFrame, max_windows: int = 4,
+def build_ranking(models: pd.DataFrame) -> pd.DataFrame:
+    """Único punto de ordenación. No redondear antes de clasificar."""
+    if RANKING_COLUMN not in models.columns:
+        return pd.DataFrame()
+    valid = (models.loc[models["Estado"].eq("OK") & models[RANKING_COLUMN].notna()]
+             .sort_values(RANKING_KEYS, ascending=True)
+             .reset_index(drop=True))
+    valid.insert(0, "Posición", range(1, len(valid) + 1))
+    return valid
+
+
+def run_backtesting(df: pd.DataFrame, max_windows: int = MAX_BACKTEST_WINDOWS,
                     progress_callback: Callable[[int, int, str], None] | None = None) -> LabResult:
     windows = get_backtest_windows(len(df), max_windows)
     if not windows:
@@ -560,6 +611,7 @@ def run_backtesting(df: pd.DataFrame, max_windows: int = 4,
     done = 0
     model_rows, config_rows, bt_rows = [], [], []
     forecasts: dict[str, np.ndarray] = {}
+
     for name in names:
         candidates = candidate_configs(name)
         eligible = all(w["train_end"] >= MODEL_MIN_TRAIN[name] for w in windows)
@@ -572,8 +624,10 @@ def run_backtesting(df: pd.DataFrame, max_windows: int = 4,
                 config_rows.append({"Modelo": name, "Configuración": config_string(cfg), "Estado": "No comparable",
                                     "Detalle": reason, "Ventanas válidas": 0})
                 done += 1
-                if progress_callback: progress_callback(done, total, name)
+                if progress_callback:
+                    progress_callback(done, total, name)
             continue
+
         evaluated: list[dict[str, Any]] = []
         for cfg in candidates:
             cfg_text = config_string(cfg)
@@ -593,22 +647,23 @@ def run_backtesting(df: pd.DataFrame, max_windows: int = 4,
                 except Exception as exc:
                     reason = f"Ventana {w['window']}: {str(exc)[:200]}"
                     break
-            fully_evaluable = len(evaluation_rows) == len(windows) * BACKTEST_HORIZON
-            if fully_evaluable:
+
+            if len(evaluation_rows) == len(windows) * BACKTEST_HORIZON:
                 a = np.asarray([x["Real"] for x in evaluation_rows])
                 p = np.asarray([x["Predicción"] for x in evaluation_rows])
-                sc = {"MAPE_%": mape(a, p), "sMAPE_%": smape(a, p), "WMAPE_%": wmape(a, p)}
-                evaluated.append({"config": cfg, "text": cfg_text, "metrics": sc,
-                                  "rows": evaluation_rows})
+                scores = {"MAPE_%": mape(a, p), "sMAPE_%": smape(a, p), "WMAPE_%": wmape(a, p)}
+                evaluated.append({"config": cfg, "text": cfg_text, "metrics": scores, "rows": evaluation_rows})
                 status = "OK"
             else:
-                sc = {"MAPE_%": np.nan, "sMAPE_%": np.nan, "WMAPE_%": np.nan}
+                scores = {"MAPE_%": np.nan, "sMAPE_%": np.nan, "WMAPE_%": np.nan}
                 status = "Error"
-            config_rows.append({"Modelo": name, "Configuración": cfg_text, **sc, "Estado": status,
-                                "Ventanas válidas": len(evaluation_rows) // BACKTEST_HORIZON,
-                                "Detalle": reason})
+
+            config_rows.append({"Modelo": name, "Configuración": cfg_text, **scores, "Estado": status,
+                                "Ventanas válidas": len(evaluation_rows) // BACKTEST_HORIZON, "Detalle": reason})
             done += 1
-            if progress_callback: progress_callback(done, total, name)
+            if progress_callback:
+                progress_callback(done, total, name)
+
         evaluated.sort(key=lambda item: (item["metrics"]["sMAPE_%"], item["metrics"]["WMAPE_%"]))
         selected = None
         final_issue = ""
@@ -620,68 +675,91 @@ def run_backtesting(df: pd.DataFrame, max_windows: int = 4,
                 break
             except Exception as exc:
                 final_issue = f"Forecast final fallido para config {item['text']}: {str(exc)[:150]}"
+
         if selected is None:
-            detail = final_issue or next((r["Detalle"] for r in reversed(config_rows) if r["Modelo"] == name and r["Detalle"]), "Sin configuraciones válidas")
+            detail = final_issue or next(
+                (r["Detalle"] for r in reversed(config_rows) if r["Modelo"] == name and r["Detalle"]),
+                "Sin configuraciones válidas",
+            )
             model_rows.append({"Modelo": name, "Estado": "Error", "Detalle": detail,
                                "Configs probadas": len(candidates), "Configs válidas": len(evaluated)})
             continue
-        sel = selected
-        valid_errors = np.asarray([item["metrics"]["sMAPE_%"] for item in evaluated], dtype=float)
-        median_error = float(np.median(valid_errors))
-        worst_error = float(np.max(valid_errors))
-        dispersion = float(np.std(valid_errors))
-        last_window = max(w["window"] for w in windows)
-        last_pred = [r["Predicción"] for r in sel["rows"] if r["Ventana"] == last_window]
-        model_rows.append({"Modelo": name, **sel["metrics"], "Métrica": "sMAPE",
-                           "Error selección_%": sel["metrics"]["sMAPE_%"],
-                           "Error ranking_%": median_error,
-                           "Mediana sMAPE configs_%": median_error,
-                           "Peor sMAPE configs_%": worst_error,
-                           "Desviación sMAPE configs_%": dispersion,
-                           "Mejor configuración": sel["text"], "Configs probadas": len(candidates),
-                           "Configs válidas": len(evaluated), "Ventanas": len(windows),
-                           **{f"BT{i+1}": last_pred[i] for i in range(BACKTEST_HORIZON)},
-                           "Estado": "OK", "Detalle": ""})
-        bt_rows.extend(sel["rows"])
+
+        errors = np.asarray([item["metrics"]["sMAPE_%"] for item in evaluated], dtype=float)
+        median_error = float(np.median(errors))
+        last_window = windows[-1]["window"]
+        last_pred = [r["Predicción"] for r in selected["rows"] if r["Ventana"] == last_window]
+        model_rows.append({
+            "Modelo": name, **selected["metrics"], "Métrica": "sMAPE",
+            SELECTION_COLUMN: selected["metrics"]["sMAPE_%"],
+            RANKING_COLUMN: median_error,
+            "Mediana sMAPE configs_%": median_error,
+            "Peor sMAPE configs_%": float(np.max(errors)),
+            "Desviación sMAPE configs_%": float(np.std(errors)),
+            "Mejor configuración": selected["text"], "Configs probadas": len(candidates),
+            "Configs válidas": len(evaluated), "Ventanas": len(windows),
+            **{f"BT{i + 1}": last_pred[i] for i in range(BACKTEST_HORIZON)},
+            "Estado": "OK", "Detalle": "",
+        })
+        bt_rows.extend(selected["rows"])
+
     models = pd.DataFrame(model_rows)
-    valid = models[(models["Estado"] == "OK") & models["Error ranking_%"].notna()].sort_values(
-        ["Error ranking_%", "Error selección_%", "WMAPE_%"]).reset_index(drop=True)
+    valid = build_ranking(models)
     if valid.empty:
         raise ValueError("No hay algoritmos con backtesting completo y forecast final válido.")
     return LabResult(models, valid, pd.DataFrame(config_rows), pd.DataFrame(bt_rows), forecasts, len(windows))
 
+
+def walk_forward_comparison(lab: LabResult) -> pd.DataFrame:
+    """Mismo ranking y misma precisión que el ensemble; no reordena."""
+    ranked = lab.valid
+    unranked = lab.models.loc[~lab.models["Modelo"].isin(ranked["Modelo"])].copy()
+    unranked["Posición"] = pd.Series(pd.NA, index=unranked.index, dtype="Int64")
+    comparison = pd.concat([ranked, unranked], ignore_index=True)
+    comparison["Posición"] = comparison["Posición"].astype("Int64")
+    comparison.insert(2, "Top 4", comparison["Posición"].le(TOP_N).fillna(False))
+    front = ["Posición", "Modelo", "Top 4", RANKING_COLUMN, SELECTION_COLUMN, "WMAPE_%"]
+    return comparison.loc[:, front + [col for col in comparison if col not in front]]
+
+
 # ========================== ENSEMBLES Y EXPORTACIONES ==========================
+
+def future_dates(df: pd.DataFrame) -> pd.DatetimeIndex:
+    return pd.date_range(df["Fecha"].max() + pd.DateOffset(months=1), periods=FORECAST_HORIZON, freq="MS")
+
+
 def future_forecast(df: pd.DataFrame, name: str, forecasts: dict[str, np.ndarray]) -> pd.DataFrame:
-    dates = pd.date_range(df["Fecha"].max() + pd.DateOffset(months=1), periods=FORECAST_HORIZON, freq="MS")
-    return pd.DataFrame({"Fecha": dates, "Forecast": round_zero(forecasts[name])})
+    return pd.DataFrame({"Fecha": future_dates(df), "Forecast": round_zero(forecasts[name])})
 
 
 def ensemble_forecasts(df: pd.DataFrame, lab: LabResult):
-    top = lab.valid.head(4)
-    if len(top) < 4:
+    top = lab.valid.head(TOP_N)
+    if len(top) < TOP_N:
         raise ValueError("El ensemble necesita al menos cuatro algoritmos con resultado válido.")
-    names = top["Modelo"].tolist()
-    fixed_weights = np.array([.4, .3, .2, .1])
-    errors = np.maximum(top["Error ranking_%"].to_numpy(float), .01)
-    inv = 1. / errors
+    errors = top[RANKING_COLUMN].to_numpy(dtype=float)
+    inv = 1. / np.maximum(errors, MIN_WEIGHT_ERROR)
     dynamic_weights = inv / inv.sum()
-    mat = np.vstack([lab.forecasts[n] for n in names])
-    dates = pd.date_range(df["Fecha"].max() + pd.DateOffset(months=1), periods=FORECAST_HORIZON, freq="MS")
-    fixed = pd.DataFrame({"Fecha": dates, "Forecast": round_zero(fixed_weights @ mat)})
+    mat = np.vstack([lab.forecasts[name] for name in top["Modelo"]])
+    dates = future_dates(df)
+    fixed = pd.DataFrame({"Fecha": dates, "Forecast": round_zero(FIXED_WEIGHTS @ mat)})
     dynamic = pd.DataFrame({"Fecha": dates, "Forecast": round_zero(dynamic_weights @ mat)})
-    detail = pd.DataFrame({"Posición": range(1, 5), "Modelo": names, "Error_%": errors,
-                           "Peso fijo": fixed_weights, "Peso dinámico": dynamic_weights})
+    detail = top[["Posición", "Modelo", RANKING_COLUMN]].copy()
+    detail["Peso fijo"] = FIXED_WEIGHTS
+    detail["Peso dinámico"] = dynamic_weights
     return fixed, dynamic, detail
 
 
-def horizontal(forecast: pd.DataFrame, forecast_type: str, model: str):
-    return {"Tipo": forecast_type, "Modelo": model, **{f"M+{i+1}": int(v) for i, v in enumerate(forecast["Forecast"])}}
+def horizontal(forecast: pd.DataFrame, forecast_type: str, model: str) -> dict:
+    return {"Tipo": forecast_type, "Modelo": model,
+            **{f"M+{i + 1}": int(v) for i, v in enumerate(forecast["Forecast"])}}
 
 
-def as_csv(data: pd.DataFrame):
+def as_csv(data: pd.DataFrame) -> bytes:
     return data.to_csv(index=False, sep=";").encode("utf-8-sig")
 
-# ========================== INTERFAZ ORIGINAL + MEJORAS ==========================
+
+# ========================== INTERFAZ STREAMLIT ==========================
+
 EXAMPLE = """Fecha\tVentas
 2025-01\t1200
 2025-02\t0
@@ -700,9 +778,6 @@ EXAMPLE = """Fecha\tVentas
 2026-03\t1500
 2026-04\t1650"""
 
-for key, value in {"raw": EXAMPLE, "counter": 0, "ready": False}.items():
-    if key not in st.session_state: st.session_state[key] = value
-
 
 def clear_history():
     st.session_state.raw = ""
@@ -710,150 +785,202 @@ def clear_history():
     st.session_state.ready = False
 
 
-with st.sidebar:
-    st.header("Configuración")
-    start_month = st.text_input("Mes inicial si pegas solo ventas", "2025-01")
-    max_windows = st.select_slider("Ventanas de backtesting (4 meses cada una)", options=[1, 2, 3, 4], value=4)
-    st.markdown("**V3:** Barrido ligero por algoritmo, selección por sMAPE a cuatro meses, ensembles Top 4.")
-    st.caption("Historia efectiva: 12–48 meses; al menos 16 meses para evaluar. Modelos ML desde 18 meses, estacionales desde 24; para competir necesitan historia suficiente en todos los cortes.")
-    for label, ok in (("statsmodels", STATSMODELS_OK), ("Prophet", PROPHET_OK),
-                      ("LightGBM", LGBM_OK), ("XGBoost", XGBOOST_OK),
-                      ("Random Forest", RFOREST_OK), ("Plotly", PLOTLY_OK)):
-        st.write(f"{label}: {'✅' if ok else '❌'}")
-
-raw_data = st.text_area("Pega Fecha y Ventas desde Excel", st.session_state.raw,
-                        height=270, key=f"data_{st.session_state.counter}")
-with st.expander("Opcional: CSV con varias referencias"):
-    st.caption("Formato largo: Referencia;Fecha;Ventas (o Estadistico;Fecha;Ventas). Selecciona una referencia para ejecutar el laboratorio.")
-    upload = st.file_uploader("Cargar CSV multirreferencia", type=["csv"])
-    csv_frame, ref_col, selected_ref = None, None, None
-    if upload is not None:
-        try:
-            csv_frame, ref_col = parse_reference_csv(upload)
-            refs = sorted(csv_frame[ref_col].dropna().unique().tolist())
-            selected_ref = st.selectbox("Referencia a analizar", refs)
-        except Exception as exc:
-            st.error(str(exc))
-            csv_frame = None
-
-col1, col2 = st.columns(2)
-calculate = col1.button("🚀 Calcular", type="primary", use_container_width=True)
-col2.button("🧹 Limpiar", on_click=clear_history, use_container_width=True)
-
-if calculate:
-    try:
-        if upload is not None and csv_frame is None:
-            raise ValueError("Corrige el CSV o elimínalo para usar los datos pegados.")
-        if csv_frame is not None:
-            frame = csv_frame[csv_frame[ref_col] == selected_ref][["Fecha", "Ventas"]]
-            df = normalize_history(frame)
-        else:
-            df = parse_pasted_data(raw_data, start_month)
-        bar = st.progress(0, text="Preparando evaluaciones...")
-        def on_progress(done: int, total: int, name: str):
-            bar.progress(min(1., done / total), text=f"Evaluando {name} · {done}/{total} configuraciones")
-        lab = run_backtesting(df, max_windows=max_windows, progress_callback=on_progress)
-        bar.empty()
-        st.session_state.update({"ready": True, "raw": raw_data, "df": df, "lab": lab,
-                                 "reference": selected_ref if csv_frame is not None else "Serie pegada"})
-    except Exception as exc:
-        st.session_state.ready = False
-        st.error(f"No se pudo calcular: {exc}")
-
-if st.session_state.ready:
-    df, lab = st.session_state.df, st.session_state.lab
-    results, valid = lab.models, lab.valid
+def show_results(df: pd.DataFrame, lab: LabResult, reference: str):
+    valid = lab.valid
     best_model = str(valid.iloc[0]["Modelo"])
-    best_error = float(valid.iloc[0]["Error ranking_%"])
+    best_error = float(valid.iloc[0][RANKING_COLUMN])
     diagnosis = demand_diagnosis(df)
-    confiability = forecast_confidence(df, best_error)
+    confidence = forecast_confidence(df, best_error)
 
     st.subheader("1. Diagnóstico")
-    st.caption(f"Referencia: {st.session_state.reference} · {len(df)} meses efectivos · {lab.window_count} ventana(s) de cuatro meses · ranking por mediana de sMAPE entre configuraciones válidas.")
+    st.caption(f"Referencia: {reference} · {len(df)} meses efectivos · {lab.window_count} ventana(s) de cuatro meses · "
+               "ranking por mediana de sMAPE entre configuraciones válidas.")
     if df.attrs.get("meses_rellenados_cero", 0):
-        st.warning(f"Se han rellenado con cero {df.attrs['meses_rellenados_cero']} meses sin registro. Comprobar si son ceros reales o datos ausentes.")
+        st.warning(f"Se han rellenado con cero {df.attrs['meses_rellenados_cero']} meses sin registro. "
+                   "Comprobar si son ceros reales o datos ausentes.")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Tipo de demanda", diagnosis["Tipo de demanda"])
     c2.metric("Meses con venta cero", f"{diagnosis['Meses con venta cero %']:.1f}%")
     c3.metric("Mejor modelo", best_model)
-    c4.metric("Confiabilidad", f"{confiability['Confiabilidad']}/100")
-    c5.metric("Nivel", f"{confiability['Indicador']} {confiability['Nivel']}")
+    c4.metric("Confiabilidad", f"{confidence['Confiabilidad']}/100")
+    c5.metric("Nivel", f"{confidence['Indicador']} {confidence['Nivel']}")
     st.info(diagnosis["Explicación"])
-    st.warning(confiability["Interpretación"])
-    st.caption("La confiabilidad es un indicador heurístico basado en los mismos cortes utilizados para seleccionar parámetros; no es una probabilidad calibrada de acierto.")
+    st.warning(confidence["Interpretación"])
+    st.caption("La confiabilidad es un indicador heurístico basado en los mismos cortes utilizados para seleccionar parámetros; "
+               "no es una probabilidad calibrada de acierto.")
     with st.expander("¿Cómo se calcula e interpreta la confiabilidad?"):
         st.markdown("""El índice combina **50% precisión histórica (sMAPE)**, **30% estabilidad (CV)** y **20% cantidad de historia**.
 
 Niveles: Muy Alta (90–100), Alta (75–89,9), Media (60–74,9), Baja (40–59,9), Muy Baja (0–39,9).""")
-        st.dataframe(pd.DataFrame([confiability]), use_container_width=True)
+        st.dataframe(pd.DataFrame([confidence]), use_container_width=True)
         st.dataframe(pd.DataFrame([diagnosis]), use_container_width=True)
-    if len(df) < 18: st.info("LightGBM, XGBoost y Random Forest se activan desde 18 meses.")
-    if len(df) < 24: st.info("Naive estacional y Holt-Winters se activan desde 24 meses.")
-    if int((results["Estado"] == "No comparable").sum()):
-        st.info("Algunos algoritmos no pueden competir todavía: necesitan suficiente entrenamiento en TODAS las ventanas rolling. Se muestran en la comparativa con el motivo.")
 
-    manual_model = st.selectbox("Modelo alternativo", results[results["Estado"] == "OK"]["Modelo"].tolist(), index=0)
-    try:
-        automatic = future_forecast(df, best_model, lab.forecasts)
-        manual = future_forecast(df, manual_model, lab.forecasts)
+    if len(df) < 18:
+        st.info("LightGBM, XGBoost y Random Forest se activan desde 18 meses.")
+    if len(df) < 24:
+        st.info("Naive estacional y Holt-Winters se activan desde 24 meses.")
+    if lab.models["Estado"].eq("No comparable").any():
+        st.info("Algunos algoritmos no pueden competir todavía: necesitan suficiente entrenamiento en todas las ventanas. "
+                "Se muestran en la comparativa con el motivo.")
+
+    manual_model = st.selectbox("Modelo alternativo", valid["Modelo"].tolist(), index=0)
+    automatic = future_forecast(df, best_model, lab.forecasts)
+    manual = future_forecast(df, manual_model, lab.forecasts)
+    output_rows = [horizontal(automatic, "Automático", best_model), horizontal(manual, "Manual", manual_model)]
+    plot_series = [(automatic, "Automático", None), (manual, "Manual", "dash")]
+    weights = None
+    if len(valid) >= TOP_N:
         fixed, dynamic, weights = ensemble_forecasts(df, lab)
-        output = pd.DataFrame([
-            horizontal(automatic, "Automático", best_model),
-            horizontal(manual, "Manual", manual_model),
+        output_rows.extend([
             horizontal(fixed, "Ensemble fijo Top 4", "0,4/0,3/0,2/0,1"),
-            horizontal(dynamic, "Ensemble dinámico Top 4", "Inverso al error"),
+            horizontal(dynamic, "Ensemble dinámico Top 4", "Inverso al error de ranking"),
         ])
-        st.subheader("2. Forecast horizontal a 18 meses")
-        st.dataframe(output, use_container_width=True)
-        st.subheader("3. Pesos del ensemble")
-        st.dataframe(weights, use_container_width=True)
-        st.caption("Se redondea únicamente el forecast de salida; el sMAPE se calcula sobre predicciones sin redondear.")
+        plot_series.extend([(fixed, "Top 4 fijo", "dot"), (dynamic, "Top 4 dinámico", "dashdot")])
+    output = pd.DataFrame(output_rows)
 
-        st.subheader("4. Comparativa walk-forward")
-        display = results.copy()
-        for column in ("MAPE_%", "sMAPE_%", "WMAPE_%", "Error selección_%",
-                       "Error ranking_%", "Mediana sMAPE configs_%", "Peor sMAPE configs_%",
-                       "Desviación sMAPE configs_%"):
-            if column in display: display[column] = display[column].round(2)
-        st.dataframe(display, use_container_width=True)
-        st.caption("Selección robusta: el ranking usa la **mediana sMAPE** entre configuraciones válidas; "
-                   "el forecast de cada algoritmo emplea su **mejor configuración**. "
-                   "La tabla también muestra el peor error y la dispersión para evitar elecciones basadas en un acierto aislado.")
-        with st.expander("🔬 Barrido por configuración: todos los parámetros evaluados", expanded=False):
-            cfg_display = lab.configs.copy()
-            for column in ("MAPE_%", "sMAPE_%", "WMAPE_%"):
-                cfg_display[column] = cfg_display[column].round(2)
-            st.dataframe(cfg_display, use_container_width=True)
-            st.caption("Un algoritmo solo compite si una configuración completa TODOS los cortes de validación. Las combinaciones se definieron manualmente para evitar una búsqueda exhaustiva.")
-        st.caption("Cuidado: se seleccionan hiperparámetros y se calcula el ranking con el mismo rolling backtest. Es útil para explorar, pero el resultado puede ser optimista. Validar después contra meses nuevos o un holdout separado.")
+    st.subheader("2. Forecast horizontal a 18 meses")
+    st.dataframe(output, use_container_width=True)
 
-        winner = lab.backtesting[lab.backtesting["Modelo"] == best_model].copy()
-        last_window = int(winner["Ventana"].max())
-        backtest = winner[winner["Ventana"] == last_window][["Fecha", "Real", "Predicción", "Horizonte"]].copy()
-        backtest = backtest.rename(columns={"Real": "Ventas", "Predicción": "Forecast"})
-        backtest["Error %"] = np.where(backtest["Ventas"] != 0,
-                                          abs(backtest["Ventas"] - backtest["Forecast"]) /
-                                          backtest["Ventas"].replace(0, np.nan) * 100, np.nan)
-        st.subheader("5. Backtesting del ganador")
-        st.caption("Última ventana: cuatro meses futuros pronosticados desde un único corte. En el CSV adicional se incluyen todos los cortes.")
-        st.dataframe(backtest, use_container_width=True)
+    st.subheader("3. Pesos del ensemble")
+    if weights is None:
+        st.info("No hay cuatro modelos válidos. Se muestra la comparativa, pero no se calcula el ensemble Top 4.")
+    else:
+        weights_display = weights.copy()
+        weights_display[RANKING_COLUMN] = weights_display[RANKING_COLUMN].round(2)
+        st.dataframe(weights_display, use_container_width=True, hide_index=True)
+        st.caption("El peso dinámico es inverso al error de ranking, normalizado para que los pesos sumen 1. "
+                   "Se aplica un mínimo de 0,01 puntos porcentuales solo al calcular el peso; "
+                   "el error mostrado es el mismo que en la comparativa.")
+    st.caption("El forecast de salida se redondea a unidades; las métricas se calculan con las predicciones sin redondear.")
 
-        if PLOTLY_OK:
-            fig = go.Figure()
-            fig.add_scatter(x=df["Fecha"], y=df["Ventas"], name="Histórico", mode="lines+markers")
-            for forecast, name, dash in ((automatic, "Automático", None), (manual, "Manual", "dash"),
-                                         (fixed, "Top 4 fijo", "dot"), (dynamic, "Top 4 dinámico", "dashdot")):
-                fig.add_scatter(x=forecast["Fecha"], y=forecast["Forecast"], name=name,
-                                mode="lines+markers", line=dict(dash=dash) if dash else None)
-            fig.update_layout(template="plotly_white", height=520)
-            st.plotly_chart(fig, use_container_width=True)
+    st.subheader("4. Comparativa walk-forward")
+    comparison = walk_forward_comparison(lab)
+    display = comparison.copy()
+    for col in ("MAPE_%", "sMAPE_%", "WMAPE_%", SELECTION_COLUMN, RANKING_COLUMN,
+                "Mediana sMAPE configs_%", "Peor sMAPE configs_%", "Desviación sMAPE configs_%"):
+        if col in display:
+            display[col] = display[col].round(2)
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.caption("Mismo orden que el ensemble: menor Error ranking_% (mediana del sMAPE de las configuraciones válidas). "
+               "Desempates: menor Error selección_% y después menor WMAPE_%. "
+               "Error selección_% y sMAPE_% corresponden a la configuración elegida para el forecast final. "
+               "El orden se determina antes del redondeo. La marca Top 4 identifica las primeras posiciones, "
+               "aunque solo se calcula el ensemble si hay cuatro modelos válidos.")
 
-        d1, d2, d3 = st.columns(3)
-        d1.download_button("Forecast CSV", as_csv(output), "forecast_v3.csv", "text/csv", use_container_width=True)
-        d2.download_button("Modelos CSV", as_csv(results), "modelos_v3.csv", "text/csv", use_container_width=True)
+    with st.expander("🔬 Barrido por configuración: todos los parámetros evaluados", expanded=False):
+        cfg_display = lab.configs.copy()
+        for col in ("MAPE_%", "sMAPE_%", "WMAPE_%"):
+            if col in cfg_display:
+                cfg_display[col] = cfg_display[col].round(2)
+        st.dataframe(cfg_display, use_container_width=True)
+        st.caption("Un algoritmo solo compite si una configuración completa todos los cortes de validación "
+                   "y produce un forecast final válido. Las combinaciones no forman una búsqueda exhaustiva.")
+    st.caption("Se seleccionan hiperparámetros y se calcula el ranking con el mismo rolling backtest. "
+               "Es útil para explorar, pero el resultado puede ser optimista. Validar con meses nuevos o un holdout separado.")
+
+    winner = lab.backtesting.loc[lab.backtesting["Modelo"].eq(best_model)]
+    last_window = int(winner["Ventana"].max())
+    backtest = winner.loc[winner["Ventana"].eq(last_window), ["Fecha", "Real", "Predicción", "Horizonte"]].copy()
+    backtest = backtest.rename(columns={"Real": "Ventas", "Predicción": "Forecast"})
+    backtest["Error %"] = (backtest["Ventas"] - backtest["Forecast"]).abs() / backtest["Ventas"].replace(0, np.nan) * 100
+    st.subheader("5. Backtesting del ganador")
+    st.caption("Última ventana: cuatro meses futuros pronosticados desde un único corte. "
+               "El CSV adicional incluye todos los cortes.")
+    st.dataframe(backtest, use_container_width=True)
+
+    if PLOTLY_OK:
+        fig = go.Figure()
+        fig.add_scatter(x=df["Fecha"], y=df["Ventas"], name="Histórico", mode="lines+markers")
+        for forecast, label, dash in plot_series:
+            fig.add_scatter(x=forecast["Fecha"], y=forecast["Forecast"], name=label,
+                            mode="lines+markers", line=dict(dash=dash) if dash else None)
+        fig.update_layout(template="plotly_white", height=520)
+        st.plotly_chart(fig, use_container_width=True)
+
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("Forecast CSV", as_csv(output), "forecast_v3.csv", "text/csv", use_container_width=True)
+    d2.download_button("Modelos CSV", as_csv(comparison), "modelos_v3.csv", "text/csv", use_container_width=True)
+    if weights is not None:
         d3.download_button("Pesos CSV", as_csv(weights), "pesos_v3.csv", "text/csv", use_container_width=True)
-        e1, e2 = st.columns(2)
-        e1.download_button("Barrido parámetros CSV", as_csv(lab.configs), "barrido_configuraciones_v3.csv", "text/csv", use_container_width=True)
-        e2.download_button("Backtesting completo CSV", as_csv(lab.backtesting), "backtesting_completo_v3.csv", "text/csv", use_container_width=True)
-    except Exception as exc:
-        st.error(f"No fue posible mostrar los resultados finales: {exc}")
+    e1, e2 = st.columns(2)
+    e1.download_button("Barrido parámetros CSV", as_csv(lab.configs),
+                       "barrido_configuraciones_v3.csv", "text/csv", use_container_width=True)
+    e2.download_button("Backtesting completo CSV", as_csv(lab.backtesting),
+                       "backtesting_completo_v3.csv", "text/csv", use_container_width=True)
+
+
+def main():
+    st.set_page_config(page_title="Forecast automático V3", page_icon="📈", layout="wide")
+    st.title("📈 Forecast automático de ventas V3")
+    st.caption("Laboratorio por referencia · barrido ligero de hiperparámetros · backtesting rolling de 4 meses · ensembles Top 4")
+
+    for key, value in {"raw": EXAMPLE, "counter": 0, "ready": False}.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    with st.sidebar:
+        st.header("Configuración")
+        start_month = st.text_input("Mes inicial si pegas solo ventas", "2025-01")
+        max_windows = st.select_slider("Ventanas de backtesting (4 meses cada una)",
+                                       options=list(range(1, MAX_BACKTEST_WINDOWS + 1)), value=MAX_BACKTEST_WINDOWS)
+        st.markdown("**V3:** Barrido ligero por algoritmo; ranking y ensembles Top 4 por mediana de sMAPE.")
+        st.caption("Historia efectiva: hasta 48 meses; al menos 16 para evaluar. Modelos ML desde 18 meses, "
+                   "estacionales desde 24; para competir necesitan historia suficiente en todos los cortes.")
+        for label, ok in (("statsmodels", STATSMODELS_OK), ("Prophet", PROPHET_OK),
+                          ("LightGBM", LGBM_OK), ("XGBoost", XGBOOST_OK),
+                          ("Random Forest", RFOREST_OK), ("Plotly", PLOTLY_OK)):
+            st.write(f"{label}: {'✅' if ok else '❌'}")
+
+    raw_data = st.text_area("Pega Fecha y Ventas desde Excel", st.session_state.raw,
+                            height=270, key=f"data_{st.session_state.counter}")
+    with st.expander("Opcional: CSV con varias referencias"):
+        st.caption("Formato largo: Referencia;Fecha;Ventas (o Estadistico;Fecha;Ventas). Selecciona una referencia para analizar.")
+        upload = st.file_uploader("Cargar CSV multirreferencia", type=["csv"])
+        csv_frame, ref_col, selected_ref = None, None, None
+        if upload is not None:
+            try:
+                csv_frame, ref_col = parse_reference_csv(upload)
+                refs = sorted(csv_frame[ref_col].dropna().unique().tolist())
+                selected_ref = st.selectbox("Referencia a analizar", refs)
+            except Exception as exc:
+                st.error(str(exc))
+                csv_frame = None
+
+    col1, col2 = st.columns(2)
+    calculate = col1.button("🚀 Calcular", type="primary", use_container_width=True)
+    col2.button("🧹 Limpiar", on_click=clear_history, use_container_width=True)
+    if calculate:
+        bar = None
+        try:
+            if upload is not None and csv_frame is None:
+                raise ValueError("Corrige el CSV o elimínalo para usar los datos pegados.")
+            if csv_frame is not None:
+                frame = csv_frame.loc[csv_frame[ref_col].eq(selected_ref), ["Fecha", "Ventas"]]
+                df = normalize_history(frame)
+            else:
+                df = parse_pasted_data(raw_data, start_month)
+
+            bar = st.progress(0, text="Preparando evaluaciones...")
+
+            def on_progress(done: int, total: int, name: str):
+                bar.progress(min(1., done / total), text=f"Evaluando {name} · {done}/{total} configuraciones")
+
+            lab = run_backtesting(df, max_windows=max_windows, progress_callback=on_progress)
+            st.session_state.update({"ready": True, "raw": raw_data, "df": df, "lab": lab,
+                                     "reference": selected_ref if csv_frame is not None else "Serie pegada"})
+        except Exception as exc:
+            st.session_state.ready = False
+            st.error(f"No se pudo calcular: {exc}")
+        finally:
+            if bar is not None:
+                bar.empty()
+
+    if st.session_state.ready:
+        try:
+            show_results(st.session_state.df, st.session_state.lab, st.session_state.reference)
+        except Exception as exc:
+            st.error(f"No fue posible mostrar los resultados finales: {exc}")
+
+
+if __name__ == "__main__":
+    main()
